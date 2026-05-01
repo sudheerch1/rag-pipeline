@@ -1,0 +1,10 @@
+# requirements.txt contents:
+pdfplumber
+python-docx
+openpyxl
+python-pptx
+beautifulsoup4
+lxml
+tiktoken
+boto3
+pytest
