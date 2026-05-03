@@ -403,6 +403,10 @@ def parse(file_bytes: bytes, parser_key: str) -> List[ParsedBlock]:
     if not parser_fn:
         return []
     try:
+        return     parser_fn = PARSER_MAP.get(parser_key)
+    if not parser_fn:
+        return []
+    try:
         return [b for b in parser_fn(file_bytes) if not b.is_empty()]
     except Exception as exc:
         # In production: replace print with structured logging
