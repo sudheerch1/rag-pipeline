@@ -7,8 +7,32 @@ from parsers import parse
 from chunker import chunk
 
 s3_client = boto3.client('s3')
+bedrock_client = boto3.client('bedrock-runtime',region_name=os.environ.get('AWS_REGION', 'us-east-1'))
 
 PROCESSED_BUCKET = os.environ.get('PROCESSED_BUCKET', 'rag-processed-911414006786')
+
+def embed_chunks(chunks):
+    """
+    Convert chunks to vectors using Bedrock Titan Embeddings
+    """
+    embeddings = []
+    for chunk in chunks:
+        response = bedrock_client.invoke_model(
+            modelId='amazon.titan-embed-text-v1',
+            body=json.dumps({
+                'inputText': chunk.text
+            })
+        )
+        result = json.loads(response['body'].read())
+        embeddings.append({
+            'chunk_index': chunk.chunk_index,
+            'text': chunk.text,
+            'embedding': result['embedding'],
+            'token_count': chunk.token_count,
+            'page': chunk.page,
+            'source_key': chunk.source_key
+        })
+    return embeddings
 
 def lambda_handler(event, context):
     """
@@ -76,6 +100,10 @@ def process_file(bucket_name, object_key):
         # Chunk blocks
         chunks = chunk(blocks, file_type)
         print(f"Created {len(chunks)} chunks")
+
+        # Generate embeddings
+        embeddings = embed_chunks(chunks)
+        print(f"Generated {len(embeddings)} embeddings")
 
         # Save chunks to processed bucket
         output_key = f"chunks/{object_key}.json"
