@@ -14,52 +14,19 @@ from models import ParsedBlock, BlockType
 # ── PDF ──────────────────────────────────────────────────────────────────────
 
 def parse_pdf(file_bytes: bytes) -> List[ParsedBlock]:
-    """
-    Extracts text page-by-page using pdfplumber.
-    Tables are extracted separately and serialised to plain text so they
-    can be chunked as their own block type.
-    Falls back gracefully if a page has no extractable text (scanned page).
-    """
-    import pdfplumber
-
-    blocks: List[ParsedBlock] = []
-
-    with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
-        for page_num, page in enumerate(pdf.pages, start=1):
-            # --- Tables first (so we can subtract them from plain text) ---
-            tables = page.extract_tables()
-            for table in tables:
-                rows = []
-                for row in table:
-                    # pdfplumber returns None for empty cells
-                    cleaned = [cell or "" for cell in row]
-                    rows.append(" | ".join(cleaned))
-                table_text = "\n".join(rows)
-                if table_text.strip():
-                    blocks.append(ParsedBlock(
-                        text=table_text,
-                        block_type=BlockType.TABLE,
-                        page=page_num,
-                    ))
-
-            # --- Plain text (excluding table bounding boxes) ---
-            text = page.extract_text(x_tolerance=2, y_tolerance=2) or ""
-            if text.strip():
-                blocks.append(ParsedBlock(
-                    text=text.strip(),
-                    block_type=BlockType.TEXT,
-                    page=page_num,
-                ))
-            elif not tables:
-                # No text AND no tables → likely scanned — flag it
-                blocks.append(ParsedBlock(
-                    text=f"[SCANNED_PAGE page={page_num}]",
-                    block_type=BlockType.METADATA,
-                    page=page_num,
-                ))
-
+    import pypdf
+    import io
+    blocks = []
+    reader = pypdf.PdfReader(io.BytesIO(file_bytes))
+    for i, page in enumerate(reader.pages):
+        text = page.extract_text() or ""
+        if text.strip():
+            blocks.append(ParsedBlock(
+                text=text,
+                block_type=BlockType.TEXT,
+                page=i + 1
+            ))
     return blocks
-
 
 # ── DOCX ─────────────────────────────────────────────────────────────────────
 
@@ -403,12 +370,7 @@ def parse(file_bytes: bytes, parser_key: str) -> List[ParsedBlock]:
     if not parser_fn:
         return []
     try:
-        return     parser_fn = PARSER_MAP.get(parser_key)
-    if not parser_fn:
-        return []
-    try:
         return [b for b in parser_fn(file_bytes) if not b.is_empty()]
     except Exception as exc:
-        # In production: replace print with structured logging
         print(f"[PARSER ERROR] parser_key={parser_key} error={exc}")
         return []

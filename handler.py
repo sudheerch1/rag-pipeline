@@ -3,8 +3,8 @@ import boto3
 import os
 import tempfile
 from detector import detect
-from parsers import parse_file
-from chunker import chunk_blocks
+from parsers import parse
+from chunker import chunk
 
 s3_client = boto3.client('s3')
 
@@ -70,11 +70,11 @@ def process_file(bucket_name, object_key):
         print(f"Detected file type: {file_type}")
 
         # Parse file into blocks
-        blocks = parse_file(tmp_path, file_type)
+        blocks = parse(file_bytes, file_type)
         print(f"Parsed {len(blocks)} blocks")
 
         # Chunk blocks
-        chunks = chunk_blocks(blocks)
+        chunks = chunk(blocks, file_type)
         print(f"Created {len(chunks)} chunks")
 
         # Save chunks to processed bucket
