@@ -5,3 +5,4 @@ __pycache__/
 *.zip
 .vscode/package/
 lambda_package.zip
+.vscode/
