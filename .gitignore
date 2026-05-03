@@ -3,4 +3,5 @@
 __pycache__/
 *.pyc
 *.zip
-.vscode/
+.vscode/package/
+lambda_package.zip
