@@ -5,11 +5,33 @@ import tempfile
 from detector import detect
 from parsers import parse
 from chunker import chunk
+from opensearchpy import OpenSearch, RequestsHttpConnection
+from requests_aws4auth import AWS4Auth
 
 s3_client = boto3.client('s3')
 bedrock_client = boto3.client('bedrock-runtime',region_name=os.environ.get('AWS_REGION', 'us-east-1'))
 
 PROCESSED_BUCKET = os.environ.get('PROCESSED_BUCKET', 'rag-processed-911414006786')
+
+OPENSEARCH_ENDPOINT = os.environ.get('OPENSEARCH_ENDPOINT', 'search-rag-vectors-xzipwfal5kzob35v4x7uzpnz7i.us-east-1.es.amazonaws.com')
+
+def get_opensearch_client():
+    credentials = boto3.Session().get_credentials()
+    awsauth = AWS4Auth(
+        credentials.access_key,
+        credentials.secret_key,
+        'us-east-1',
+        'es',
+        session_token=credentials.token
+    )
+    return OpenSearch(
+        hosts=[{'host': OPENSEARCH_ENDPOINT, 'port': 443}],
+        http_auth=awsauth,
+        use_ssl=True,
+        verify_certs=True,
+        connection_class=RequestsHttpConnection
+    )
+
 
 def embed_chunks(chunks):
     """
@@ -33,6 +55,23 @@ def embed_chunks(chunks):
             'source_key': chunk.source_key
         })
     return embeddings
+
+
+def store_in_opensearch(embeddings):
+    client = get_opensearch_client()
+    for item in embeddings:
+        client.index(
+            index='rag-chunks',
+            body={
+                'text': item['text'],
+                'embedding': item['embedding'],
+                'source_key': item['source_key'],
+                'page': item['page'],
+                'chunk_index': item['chunk_index']
+            }
+        )
+    print(f"Stored {len(embeddings)} embeddings in OpenSearch")
+
 
 def lambda_handler(event, context):
     """
@@ -105,6 +144,9 @@ def process_file(bucket_name, object_key):
         embeddings = embed_chunks(chunks)
         print(f"Generated {len(embeddings)} embeddings")
 
+        # Store in OpenSearch
+        store_in_opensearch(embeddings)
+        
         # Save chunks to processed bucket
         output_key = f"chunks/{object_key}.json"
         chunks_data = [chunk.__dict__ for chunk in chunks]
