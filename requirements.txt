@@ -1,10 +1,22 @@
-# requirements.txt contents:
-pdfplumber
-python-docx
-openpyxl
-python-pptx
-beautifulsoup4
-lxml
-tiktoken
-boto3
-pytest
+# Core AWS
+boto3>=1.34.0
+botocore>=1.34.0
+
+# Document parsing
+pypdf>=3.17.0
+python-docx>=1.1.0
+openpyxl>=3.1.2
+python-pptx>=0.6.23
+beautifulsoup4>=4.12.0
+lxml>=5.1.0
+
+# CSV/Data
+pandas>=2.1.0
+
+# Chunking/Tokenization
+tiktoken>=0.6.0
+
+# OpenSearch
+opensearch-py>=2.4.0
+requests>=2.31.0
+requests-aws4auth>=1.2.3
