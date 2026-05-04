@@ -11,6 +11,9 @@ from requests_aws4auth import AWS4Auth
 s3_client = boto3.client('s3')
 bedrock_client = boto3.client('bedrock-runtime',region_name=os.environ.get('AWS_REGION', 'us-east-1'))
 
+dynamodb = boto3.resource('dynamodb')
+METADATA_TABLE = os.environ.get('METADATA_TABLE', 'rag-metadata')
+
 PROCESSED_BUCKET = os.environ.get('PROCESSED_BUCKET', 'rag-processed-911414006786')
 
 OPENSEARCH_ENDPOINT = os.environ.get('OPENSEARCH_ENDPOINT', 'search-rag-vectors-xzipwfal5kzob35v4x7uzpnz7i.us-east-1.es.amazonaws.com')
@@ -72,6 +75,22 @@ def store_in_opensearch(embeddings):
         )
     print(f"Stored {len(embeddings)} embeddings in OpenSearch")
 
+
+def save_metadata(object_key, file_type, blocks, chunks, status, error=None):
+    table = dynamodb.Table(METADATA_TABLE)
+    from datetime import datetime, timezone
+    table.put_item(
+        Item={
+            'document_id': object_key,
+            'status': status,
+            'file_type': file_type,
+            'blocks': blocks,
+            'chunks': chunks,
+            'timestamp': datetime.now(timezone.utc).isoformat(),
+            'error': error or 'none'
+        }
+    )
+    print(f"Metadata saved for: {object_key}")
 
 def lambda_handler(event, context):
     """
@@ -147,6 +166,15 @@ def process_file(bucket_name, object_key):
         # Store in OpenSearch
         store_in_opensearch(embeddings)
         
+        # Save metadata
+        save_metadata(
+            object_key=object_key,
+            file_type=file_type,
+            blocks=len(blocks),
+            chunks=len(chunks),
+            status='completed'
+        )
+
         # Save chunks to processed bucket
         output_key = f"chunks/{object_key}.json"
         chunks_data = [chunk.__dict__ for chunk in chunks]
@@ -166,6 +194,18 @@ def process_file(bucket_name, object_key):
             'chunks': len(chunks),
             'output_key': output_key
         }
+
+    except Exception as e:
+        print(f"Error processing record: {str(e)}")
+        save_metadata(
+            object_key=object_key,
+            file_type='unknown',
+            blocks=0,
+            chunks=0,
+            status='failed',
+            error=str(e)
+        )
+        raise
 
     finally:
         # Always clean up temp file
