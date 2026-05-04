@@ -88,13 +88,20 @@ Answer:"""
     return result['output']['message']['content'][0]['text']
 
 def lambda_handler(event, context):
-    # Get question from request
-    body = json.loads(event.get('body', '{}'))
+    # Handle both proxy and non-proxy integration
+    if isinstance(event.get('body'), str):
+        body = json.loads(event.get('body', '{}'))
+    elif isinstance(event.get('body'), dict):
+        body = event.get('body', {})
+    else:
+        body = event  # direct invocation
+
     question = body.get('question', '')
 
     if not question:
         return {
             'statusCode': 400,
+            'headers': {'Content-Type': 'application/json'},
             'body': json.dumps({'error': 'No question provided'})
         }
 
@@ -118,12 +125,13 @@ def lambda_handler(event, context):
             'score': hit['_score']
         })
 
-    # Generate answer using Claude
+    # Generate answer
     answer = generate_answer(question, chunks)
     print(f"Answer generated")
 
     return {
         'statusCode': 200,
+        'headers': {'Content-Type': 'application/json'},
         'body': json.dumps({
             'question': question,
             'answer': answer,
