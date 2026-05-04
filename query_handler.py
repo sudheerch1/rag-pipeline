@@ -52,6 +52,41 @@ def search_opensearch(question_vector, top_k=5):
     response = client.search(index='rag-chunks', body=query)
     return response['hits']['hits']
 
+
+def generate_answer(question, chunks):
+    # Build context from chunks
+    context = "\n\n".join([
+        f"Source: {chunk['source']} (Page {chunk['page']})\n{chunk['text']}"
+        for chunk in chunks
+    ])
+
+    prompt = f"""You are a helpful assistant. Answer the question based only on the provided context.
+If the answer is not in the context, say "I cannot find this information in the provided documents."
+
+Context:
+{context}
+
+Question: {question}
+
+Answer:"""
+
+    response = bedrock_client.invoke_model(
+        modelId='amazon.nova-micro-v1:0',
+        body=json.dumps({
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"text": prompt}
+                    ]
+                }
+            ]
+        })
+    )
+
+    result = json.loads(response['body'].read())
+    return result['output']['message']['content'][0]['text']
+
 def lambda_handler(event, context):
     # Get question from request
     body = json.loads(event.get('body', '{}'))
@@ -73,20 +108,32 @@ def lambda_handler(event, context):
     hits = search_opensearch(question_vector)
     print(f"Found {len(hits)} results")
 
-    # Format results
-    results = []
+    # Format chunks
+    chunks = []
     for hit in hits:
-        results.append({
+        chunks.append({
             'text': hit['_source']['text'],
             'source': hit['_source']['source_key'],
             'page': hit['_source'].get('page'),
             'score': hit['_score']
         })
 
+    # Generate answer using Claude
+    answer = generate_answer(question, chunks)
+    print(f"Answer generated")
+
     return {
         'statusCode': 200,
         'body': json.dumps({
             'question': question,
-            'results': results
+            'answer': answer,
+            'sources': [
+                {
+                    'source': c['source'],
+                    'page': c['page'],
+                    'score': c['score']
+                }
+                for c in chunks
+            ]
         })
     }
