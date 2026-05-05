@@ -158,6 +158,8 @@ def process_file(bucket_name, object_key):
 
         # Chunk blocks
         chunks = chunk(blocks, file_type)
+        for c in chunks:
+            c.source_key = object_key  # ← add this line
         print(f"Created {len(chunks)} chunks")
 
         # Generate embeddings
