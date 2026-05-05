@@ -1,22 +1,15 @@
-import boto3
 import requests
 from requests.auth import HTTPBasicAuth
-import os
+from config import get_opensearch_endpoint, get_opensearch_credentials
 
-# Basic authentication
+# Get everything from AWS
+endpoint = f"https://{get_opensearch_endpoint(profile_name='rag-dev')}"
+username, password = get_opensearch_credentials(profile_name='rag-dev')
+auth = HTTPBasicAuth(username, password)
 
+print(f"Connecting to: {endpoint}")
+print(f"Username: {username}")
 
-# OpenSearch endpoint
-endpoint = 'https://search-rag-vectors-xzipwfal5kzob35v4x7uzpnz7i.us-east-1.es.amazonaws.com'
-
-# AWS authentication
-session = boto3.Session(profile_name='rag-dev')
-credentials = session.get_credentials()
-
-auth = HTTPBasicAuth(
-    os.environ.get('OPENSEARCH_USER', ''),
-    os.environ.get('OPENSEARCH_PASSWORD', '')
-)
 # Index mapping
 index_body = {
     "mappings": {
@@ -40,7 +33,7 @@ index_body = {
 url = f"{endpoint}/rag-chunks"
 response = requests.put(
     url,
-    auth=awsauth,
+    auth=auth,
     json=index_body,
     headers={"Content-Type": "application/json"}
 )

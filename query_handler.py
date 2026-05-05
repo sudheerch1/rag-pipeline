@@ -3,12 +3,12 @@ import boto3
 import os
 from opensearchpy import OpenSearch, RequestsHttpConnection
 from requests_aws4auth import AWS4Auth
+from config import get_opensearch_endpoint
 
 bedrock_client = boto3.client('bedrock-runtime', 
     region_name=os.environ.get('AWS_REGION', 'us-east-1'))
 
-OPENSEARCH_ENDPOINT = os.environ.get('OPENSEARCH_ENDPOINT', 
-    'search-rag-vectors-xzipwfal5kzob35v4x7uzpnz7i.us-east-1.es.amazonaws.com')
+OPENSEARCH_ENDPOINT = get_opensearch_endpoint()
 
 def get_opensearch_client():
     credentials = boto3.Session().get_credentials()

@@ -7,6 +7,7 @@ from parsers import parse
 from chunker import chunk
 from opensearchpy import OpenSearch, RequestsHttpConnection
 from requests_aws4auth import AWS4Auth
+from config import get_opensearch_endpoint
 
 s3_client = boto3.client('s3')
 bedrock_client = boto3.client('bedrock-runtime',region_name=os.environ.get('AWS_REGION', 'us-east-1'))
@@ -16,7 +17,7 @@ METADATA_TABLE = os.environ.get('METADATA_TABLE', 'rag-metadata')
 
 PROCESSED_BUCKET = os.environ.get('PROCESSED_BUCKET', 'rag-processed-911414006786')
 
-OPENSEARCH_ENDPOINT = os.environ.get('OPENSEARCH_ENDPOINT', 'search-rag-vectors-xzipwfal5kzob35v4x7uzpnz7i.us-east-1.es.amazonaws.com')
+OPENSEARCH_ENDPOINT = get_opensearch_endpoint()
 
 def get_opensearch_client():
     credentials = boto3.Session().get_credentials()
