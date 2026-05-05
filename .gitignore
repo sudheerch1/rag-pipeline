@@ -6,3 +6,5 @@ __pycache__/
 .vscode/package/
 lambda_package.zip
 .vscode/
+Add-Content .gitignore ".env"
+Add-Content .gitignore "*.env"
