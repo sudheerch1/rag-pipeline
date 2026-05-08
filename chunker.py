@@ -6,9 +6,10 @@ Three strategies, selectable per document type:
   1. recursive   — General purpose. Tries to split on paragraphs → sentences →
                    words. Best for prose (PDF text, DOCX, HTML, Markdown).
 
-  2. semantic    — Groups consecutive blocks by meaning similarity using a
-                   simple sliding-window sentence encoder. Best for long
-                   narrative documents. Requires sentence-transformers.
+  2. semantic    — Groups consecutive blocks by meaning similarity using
+                   Amazon Bedrock Titan embeddings (no local ML libraries needed).
+                   Splits when cosine similarity between adjacent blocks drops
+                   below similarity_threshold. Best for long narrative documents.
 
   3. table_aware — Keeps table blocks intact (never splits mid-table).
                    Applies recursive to text blocks. Best for mixed docs.
@@ -20,35 +21,62 @@ All strategies respect:
 """
 
 import re
+import json
+import boto3
+import os
 from typing import List, Optional
 
 from models import ParsedBlock, Chunk, BlockType
 
 
 # ── Token counting ────────────────────────────────────────────────────────────
-# We use tiktoken (cl100k_base = GPT-4 / Claude tokeniser approximation).
-# Falls back to word-count heuristic if tiktoken is unavailable.
 
 def count_tokens(text: str) -> int:
-    """
-    Token counter. In production use tiktoken for exact counts:
-        import tiktoken
-        enc = tiktoken.get_encoding("cl100k_base")
-        return len(enc.encode(text))
-    Word-count approximation used here: 1 word ≈ 1.3 tokens on average.
-    """
     words = len(text.split())
     return int(words * 1.3)
 
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-MAX_TOKENS     = 512    # hard ceiling per chunk — fits most embedding models
-OVERLAP_TOKENS = 64     # tokens of overlap between consecutive chunks
-MIN_TOKENS     = 30     # discard chunks shorter than this (usually noise)
+MAX_TOKENS     = 512
+OVERLAP_TOKENS = 64
+MIN_TOKENS     = 30
 
-# Separators tried in order for recursive splitting
 SEPARATORS = ["\n\n", "\n", ". ", "! ", "? ", "; ", ", ", " ", ""]
+
+
+# ── Bedrock client for semantic chunking ──────────────────────────────────────
+
+def get_bedrock_client():
+    return boto3.client(
+        'bedrock-runtime',
+        region_name=os.environ.get('AWS_REGION', 'us-east-1')
+    )
+
+
+def get_embedding_bedrock(text: str, bedrock_client) -> List[float]:
+    """
+    Get embedding from Amazon Bedrock Titan Embeddings.
+    Uses same model as ingestion pipeline for consistency.
+    Truncates to 512 chars for speed during chunking.
+    """
+    response = bedrock_client.invoke_model(
+        modelId='amazon.titan-embed-text-v1',
+        body=json.dumps({'inputText': text[:512]})
+    )
+    result = json.loads(response['body'].read())
+    return result['embedding']
+
+
+def cosine_similarity(a: List[float], b: List[float]) -> float:
+    """Compute cosine similarity between two vectors."""
+    import math
+    dot = sum(x * y for x, y in zip(a, b))
+    norm_a = math.sqrt(sum(x * x for x in a))
+    norm_b = math.sqrt(sum(x * x for x in b))
+    if norm_a == 0 or norm_b == 0:
+        return 0.0
+    return dot / (norm_a * norm_b)
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -60,7 +88,6 @@ def _make_chunk(
     start_block: int,
     end_block:   int,
 ) -> Optional[Chunk]:
-    """Construct a Chunk from text + metadata. Returns None if below MIN_TOKENS."""
     text = text.strip()
     tokens = count_tokens(text)
     if tokens < MIN_TOKENS:
@@ -81,21 +108,13 @@ def _make_chunk(
 
 
 def _split_text_recursive(text: str, max_tokens: int, separators: List[str]) -> List[str]:
-    """
-    Recursively splits text using progressively finer separators until every
-    piece fits within max_tokens. This is the same algorithm as LangChain's
-    RecursiveCharacterTextSplitter, but token-aware.
-    """
     if count_tokens(text) <= max_tokens:
         return [text]
 
-    # Try each separator in order
     for sep in separators:
         if sep == "":
-            # Last resort: hard split by character
             pieces = []
             while text:
-                # Find the longest prefix that fits
                 lo, hi = 0, len(text)
                 while lo < hi - 1:
                     mid = (lo + hi) // 2
@@ -118,7 +137,6 @@ def _split_text_recursive(text: str, max_tokens: int, separators: List[str]) -> 
                 else:
                     if current:
                         chunks.append(current)
-                    # Part itself may be too long → recurse
                     remaining_seps = separators[separators.index(sep) + 1:]
                     if count_tokens(part) > max_tokens and remaining_seps:
                         chunks.extend(_split_text_recursive(part, max_tokens, remaining_seps))
@@ -132,24 +150,19 @@ def _split_text_recursive(text: str, max_tokens: int, separators: List[str]) -> 
 
 
 def _add_overlap(pieces: List[str], overlap_tokens: int) -> List[str]:
-    """
-    Adds a trailing suffix from the previous chunk to the start of the next
-    one, preserving context across boundaries.
-    """
     if len(pieces) <= 1 or overlap_tokens == 0:
         return pieces
 
     result = [pieces[0]]
     for i in range(1, len(pieces)):
         prev_words = pieces[i - 1].split()
-        # Approximate: grab words from end of previous chunk until we hit overlap budget
         overlap_words = []
         token_budget = overlap_tokens
         for w in reversed(prev_words):
             if token_budget <= 0:
                 break
             overlap_words.insert(0, w)
-            token_budget -= 1          # rough approximation: 1 word ≈ 1 token
+            token_budget -= 1
 
         overlap_text = " ".join(overlap_words)
         result.append(overlap_text + " " + pieces[i] if overlap_text else pieces[i])
@@ -164,14 +177,9 @@ def chunk_recursive(
     max_tokens:    int = MAX_TOKENS,
     overlap_tokens: int = OVERLAP_TOKENS,
 ) -> List[Chunk]:
-    """
-    Merges consecutive small blocks, then recursively splits large ones.
-    Respects section boundaries — never merges blocks from different sections.
-    """
     chunks: List[Chunk] = []
     chunk_index = 0
 
-    # Merge adjacent same-section blocks into a window, then split if needed
     buffer_text  = ""
     buffer_start = 0
     buffer_block: Optional[ParsedBlock] = None
@@ -192,11 +200,9 @@ def chunk_recursive(
         buffer_block = None
 
     for i, block in enumerate(blocks):
-        # Flush on section change to avoid cross-section contamination
         if buffer_block and block.section != buffer_block.section:
             flush(i - 1)
 
-        # Table blocks: always emit as their own chunk (don't merge)
         if block.block_type == BlockType.TABLE:
             flush(i - 1)
             pieces = _split_text_recursive(block.text, max_tokens, ["\n"])
@@ -222,74 +228,93 @@ def chunk_recursive(
     return chunks
 
 
-# ── Strategy 2: Semantic ──────────────────────────────────────────────────────
+# ── Strategy 2: Semantic (Bedrock-powered) ────────────────────────────────────
 
 def chunk_semantic(
-    blocks:        List[ParsedBlock],
-    max_tokens:    int = MAX_TOKENS,
-    overlap_tokens: int = OVERLAP_TOKENS,
+    blocks:               List[ParsedBlock],
+    max_tokens:           int = MAX_TOKENS,
+    overlap_tokens:       int = OVERLAP_TOKENS,
     similarity_threshold: float = 0.75,
 ) -> List[Chunk]:
     """
-    Uses sentence embeddings to group semantically related consecutive blocks.
-    Falls back to recursive chunking if sentence-transformers is not available.
+    Semantic chunking using Amazon Bedrock Titan embeddings.
 
-    Groups blocks while cosine similarity between adjacent block embeddings
-    stays above similarity_threshold, then flushes a chunk.
+    How it works:
+      1. Embed each block using Bedrock Titan (same model as ingestion)
+      2. Compute cosine similarity between adjacent blocks
+      3. Split when similarity drops below threshold (topic change detected)
+      4. Apply recursive splitting if any group exceeds max_tokens
+
+    Advantages over fixed-size chunking:
+      → Keeps related sentences together
+      → Splits at natural topic boundaries
+      → Better context preservation
+      → More relevant chunks retrieved
+
+    Falls back to recursive chunking if Bedrock is unavailable.
     """
+    if not blocks:
+        return []
+
+    print(f"[semantic chunker] Embedding {len(blocks)} blocks via Bedrock...")
+
     try:
-        from sentence_transformers import SentenceTransformer
-        import numpy as np
-    except ImportError:
-        print("[chunker] sentence-transformers not available, falling back to recursive")
+        bedrock = get_bedrock_client()
+
+        # Embed all blocks using Bedrock Titan
+        embeddings = []
+        for i, block in enumerate(blocks):
+            try:
+                emb = get_embedding_bedrock(block.text, bedrock)
+                embeddings.append(emb)
+            except Exception as e:
+                print(f"[semantic chunker] Block {i} embedding failed: {e}, using zero vector")
+                embeddings.append([0.0] * 1536)
+
+        print(f"[semantic chunker] Embeddings generated, grouping by similarity...")
+
+        chunks: List[Chunk] = []
+        chunk_index = 0
+        group_start = 0
+        group_blocks = [blocks[0]]
+
+        for i in range(1, len(blocks)):
+            sim = cosine_similarity(embeddings[i - 1], embeddings[i])
+            group_text = "\n\n".join(b.text for b in group_blocks + [blocks[i]])
+            over_budget = count_tokens(group_text) > max_tokens
+            section_break = blocks[i].section != blocks[i - 1].section
+
+            # Split if: low similarity (topic change) OR too large OR section break
+            if sim < similarity_threshold or over_budget or section_break:
+                text = "\n\n".join(b.text for b in group_blocks)
+                pieces = _split_text_recursive(text, max_tokens, SEPARATORS)
+                pieces = _add_overlap(pieces, overlap_tokens)
+                for piece in pieces:
+                    c = _make_chunk(piece, chunk_index, group_blocks[0], group_start, i - 1)
+                    if c:
+                        chunks.append(c)
+                        chunk_index += 1
+                group_start  = i
+                group_blocks = [blocks[i]]
+            else:
+                group_blocks.append(blocks[i])
+
+        # Flush final group
+        text = "\n\n".join(b.text for b in group_blocks)
+        pieces = _split_text_recursive(text, max_tokens, SEPARATORS)
+        pieces = _add_overlap(pieces, overlap_tokens)
+        for piece in pieces:
+            c = _make_chunk(piece, chunk_index, group_blocks[0], group_start, len(blocks) - 1)
+            if c:
+                chunks.append(c)
+                chunk_index += 1
+
+        print(f"[semantic chunker] Created {len(chunks)} semantic chunks from {len(blocks)} blocks")
+        return chunks
+
+    except Exception as e:
+        print(f"[semantic chunker] Failed ({e}), falling back to recursive chunking")
         return chunk_recursive(blocks, max_tokens, overlap_tokens)
-
-    model = SentenceTransformer("all-MiniLM-L6-v2")  # small, fast, good quality
-
-    # Embed all blocks (batch for efficiency)
-    texts = [b.text[:512] for b in blocks]  # truncate for embedding speed
-    embeddings = model.encode(texts, batch_size=32, show_progress_bar=False)
-
-    def cosine(a, b) -> float:
-        return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-9))
-
-    chunks: List[Chunk] = []
-    chunk_index = 0
-    group_start = 0
-    group_blocks = [blocks[0]]
-
-    for i in range(1, len(blocks)):
-        sim = cosine(embeddings[i - 1], embeddings[i])
-        group_text = "\n\n".join(b.text for b in group_blocks + [blocks[i]])
-        over_budget = count_tokens(group_text) > max_tokens
-        section_break = blocks[i].section != blocks[i - 1].section
-
-        if sim < similarity_threshold or over_budget or section_break:
-            # Flush current group
-            text = "\n\n".join(b.text for b in group_blocks)
-            pieces = _split_text_recursive(text, max_tokens, SEPARATORS)
-            pieces = _add_overlap(pieces, overlap_tokens)
-            for piece in pieces:
-                c = _make_chunk(piece, chunk_index, group_blocks[0], group_start, i - 1)
-                if c:
-                    chunks.append(c)
-                    chunk_index += 1
-            group_start  = i
-            group_blocks = [blocks[i]]
-        else:
-            group_blocks.append(blocks[i])
-
-    # Flush final group
-    text = "\n\n".join(b.text for b in group_blocks)
-    pieces = _split_text_recursive(text, max_tokens, SEPARATORS)
-    pieces = _add_overlap(pieces, overlap_tokens)
-    for piece in pieces:
-        c = _make_chunk(piece, chunk_index, group_blocks[0], group_start, len(blocks) - 1)
-        if c:
-            chunks.append(c)
-            chunk_index += 1
-
-    return chunks
 
 
 # ── Strategy 3: Table-aware ───────────────────────────────────────────────────
@@ -299,26 +324,18 @@ def chunk_table_aware(
     max_tokens:    int = MAX_TOKENS,
     overlap_tokens: int = OVERLAP_TOKENS,
 ) -> List[Chunk]:
-    """
-    Separates table blocks from text blocks.
-    Text blocks → recursive strategy.
-    Table blocks → kept whole if under budget, column-split if over.
-    Final list is re-sorted by original block order.
-    """
     text_blocks  = [(i, b) for i, b in enumerate(blocks) if b.block_type != BlockType.TABLE]
     table_blocks = [(i, b) for i, b in enumerate(blocks) if b.block_type == BlockType.TABLE]
 
-    result_indexed: List[tuple] = []  # (original_index, Chunk)
+    result_indexed: List[tuple] = []
     chunk_index = 0
 
-    # Process text blocks with recursive strategy
     text_chunks = chunk_recursive([b for _, b in text_blocks], max_tokens, overlap_tokens)
     for c in text_chunks:
         result_indexed.append((text_blocks[c.start_block][0], c))
         c.chunk_index = chunk_index
         chunk_index += 1
 
-    # Process table blocks
     for orig_i, block in table_blocks:
         if count_tokens(block.text) <= max_tokens:
             c = _make_chunk(block.text, chunk_index, block, orig_i, orig_i)
@@ -326,7 +343,6 @@ def chunk_table_aware(
                 result_indexed.append((orig_i, c))
                 chunk_index += 1
         else:
-            # Table too large: split by row
             rows = block.text.split("\n")
             batch: List[str] = []
             for row in rows:
@@ -347,7 +363,6 @@ def chunk_table_aware(
                     result_indexed.append((orig_i, c))
                     chunk_index += 1
 
-    # Re-sort by original document order, re-index
     result_indexed.sort(key=lambda x: x[0])
     final = []
     for new_i, (_, c) in enumerate(result_indexed):
@@ -359,17 +374,18 @@ def chunk_table_aware(
 
 # ── Strategy selector ─────────────────────────────────────────────────────────
 
-# Maps parser_key → best chunking strategy for that format
+# Maps parser_key → best chunking strategy
+# semantic = uses Bedrock embeddings to detect topic boundaries
 STRATEGY_MAP = {
-    "pdf":      "table_aware",
-    "docx":     "table_aware",
-    "xlsx":     "table_aware",
+    "pdf":      "semantic",     # ← upgraded from table_aware to semantic
+    "docx":     "semantic",     # ← upgraded from table_aware to semantic
+    "xlsx":     "table_aware",  # tables stay table_aware
     "csv":      "table_aware",
     "pptx":     "recursive",
-    "html":     "recursive",
+    "html":     "semantic",     # ← upgraded to semantic
     "json":     "recursive",
-    "text":     "recursive",
-    "markdown": "recursive",
+    "text":     "semantic",     # ← upgraded to semantic
+    "markdown": "semantic",     # ← upgraded to semantic
     "email":    "recursive",
 }
 
@@ -382,8 +398,9 @@ def chunk(
     overlap_tokens: int = OVERLAP_TOKENS,
 ) -> List[Chunk]:
     """
-    Main entry point. Picks a strategy automatically from fmt, or uses
-    an explicit override. Skips empty block lists gracefully.
+    Main entry point. Picks a strategy automatically from fmt.
+    PDF, DOCX, HTML, text, markdown now use semantic chunking by default.
+    Falls back to recursive if Bedrock is unavailable.
     """
     if not blocks:
         return []
