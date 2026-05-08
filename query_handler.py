@@ -35,6 +35,40 @@ def get_opensearch_client():
         connection_class=RequestsHttpConnection
     )
 
+def generate_hyde_answer(question: str) -> str:
+    """
+    HyDE: Generate a hypothetical answer to improve retrieval.
+    The hypothetical answer is embedded instead of the question,
+    as answers are closer in vector space to real answer chunks.
+    Falls back to original question if generation fails.
+    """
+    prompt = f"""Write a short factual passage that would directly answer this question.
+Write as if it's extracted from a legal document. 2-3 sentences only.
+
+Question: {question}
+
+Passage:"""
+
+    try:
+        response = bedrock_client.invoke_model(
+            modelId='amazon.nova-micro-v1:0',
+            body=json.dumps({
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [{"text": prompt}]
+                    }
+                ]
+            })
+        )
+        result = json.loads(response['body'].read())
+        hyde_text = result['output']['message']['content'][0]['text']
+        print(f"HyDE generated: {hyde_text[:100]}...")
+        return hyde_text
+    except Exception as e:
+        print(f"HyDE failed (non-blocking): {str(e)}")
+        return question  # fallback to original question
+
 def embed_question(question):
     response = bedrock_client.invoke_model(
         modelId='amazon.titan-embed-text-v1',
@@ -199,9 +233,10 @@ def lambda_handler(event, context):
 
     print(f"Question: {question}")
 
-    # Step 1: Embed question
-    question_vector = embed_question(question)
-    print(f"Question embedded")
+    # Step 1: HyDE → generate hypothetical answer → embed it
+    hyde_text = generate_hyde_answer(question)
+    question_vector = embed_question(hyde_text)
+    print(f"Question embedded with HyDE")
 
     # Step 2: Hybrid search - get top 10 candidates
     hits = search_opensearch(question, question_vector, top_k=10)
