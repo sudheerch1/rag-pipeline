@@ -51,11 +51,12 @@ def search_opensearch(question, question_vector, top_k=5):
             "hybrid": {
                 "queries": [
                     {
-                        "match": {
-                            "text": {
-                                "query": question,
-                                "boost": 1.0
-                            }
+                        "multi_match": {
+                            "query": question,
+                            "fields": [
+                                "text^1.0",
+                                "hyq_questions^2.0"  # ← boost HyQ matches higher
+                            ]
                         }
                     },
                     {
@@ -69,7 +70,7 @@ def search_opensearch(question, question_vector, top_k=5):
                 ]
             }
         },
-        "_source": ["text", "source_key", "page", "chunk_index"]
+        "_source": ["text", "source_key", "page", "chunk_index", "hyq_questions", "section"]
     }
     response = client.search(
         index='rag-chunks',
@@ -77,6 +78,7 @@ def search_opensearch(question, question_vector, top_k=5):
         params={"search_pipeline": "hybrid-search-pipeline"}
     )
     return response['hits']['hits']
+
 
 def generate_answer(question, chunks):
     context = "\n\n".join([

@@ -42,21 +42,10 @@ def get_opensearch_client():
 # ── Duplicate Detection ───────────────────────────────────────────────────────
 
 def compute_hash(file_bytes: bytes) -> str:
-    """
-    Compute SHA-256 hash of file contents.
-    Returns a 64-character hex string — unique fingerprint of the file.
-    """
     return hashlib.sha256(file_bytes).hexdigest()
 
 
 def check_duplicate(content_hash: str) -> dict | None:
-    """
-    Query DynamoDB GSI to check if this content hash already exists.
-
-    Returns:
-        dict  → existing item if duplicate found (contains document_id, timestamp etc.)
-        None  → no duplicate, safe to process
-    """
     table = dynamodb.Table(METADATA_TABLE)
     response = table.query(
         IndexName=HASH_INDEX_NAME,
@@ -66,26 +55,81 @@ def check_duplicate(content_hash: str) -> dict | None:
     return items[0] if items else None
 
 
+# ── HyQ: Hypothetical Question Generation ────────────────────────────────────
+
+def generate_hyq_questions(chunk_text: str) -> list[str]:
+    """
+    Generate 3 hypothetical questions that this chunk answers.
+    Uses Amazon Nova Micro for fast, cost-effective generation.
+
+    HyQ improves retrieval by matching user questions against
+    pre-generated questions rather than raw text — much better semantic match.
+
+    Returns list of questions, empty list on failure (non-blocking).
+    """
+    prompt = f"""Given the following text passage, generate exactly 3 questions that this passage directly answers.
+Return ONLY the questions, one per line, with no numbering, bullets, or extra text.
+
+Passage:
+{chunk_text[:1000]}
+
+Questions:"""
+
+    try:
+        response = bedrock_client.invoke_model(
+            modelId='amazon.nova-micro-v1:0',
+            body=json.dumps({
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [{"text": prompt}]
+                    }
+                ]
+            })
+        )
+        result = json.loads(response['body'].read())
+        raw = result['output']['message']['content'][0]['text']
+
+        # Parse questions — one per line, filter empty lines
+        questions = [q.strip() for q in raw.strip().split('\n') if q.strip()]
+        questions = [q for q in questions if q.endswith('?')][:3]
+        return questions
+
+    except Exception as e:
+        print(f"HyQ generation failed for chunk (non-blocking): {str(e)}")
+        return []
+
+
 # ── Embedding ─────────────────────────────────────────────────────────────────
 
 def embed_chunks(chunks):
     """
     Convert chunks to vectors using Bedrock Titan Embeddings.
+    Also generates HyQ questions for each chunk.
     """
     embeddings = []
-    for chunk in chunks:
+    for i, chunk in enumerate(chunks):
+        # Generate embedding
         response = bedrock_client.invoke_model(
             modelId='amazon.titan-embed-text-v1',
             body=json.dumps({'inputText': chunk.text})
         )
         result = json.loads(response['body'].read())
+
+        # Generate HyQ questions
+        hyq_questions = generate_hyq_questions(chunk.text)
+        if hyq_questions:
+            print(f"  Chunk {i}: generated {len(hyq_questions)} HyQ questions")
+
         embeddings.append({
             'chunk_index': chunk.chunk_index,
             'text': chunk.text,
             'embedding': result['embedding'],
             'token_count': chunk.token_count,
             'page': chunk.page,
-            'source_key': chunk.source_key
+            'source_key': chunk.source_key,
+            'hyq_questions': ' | '.join(hyq_questions),  # stored as searchable text
+            'section': getattr(chunk, 'section', '') or '',
         })
     return embeddings
 
@@ -102,7 +146,9 @@ def store_in_opensearch(embeddings):
                 'embedding': item['embedding'],
                 'source_key': item['source_key'],
                 'page': item['page'],
-                'chunk_index': item['chunk_index']
+                'chunk_index': item['chunk_index'],
+                'hyq_questions': item['hyq_questions'],
+                'section': item['section'],
             }
         )
     print(f"Stored {len(embeddings)} embeddings in OpenSearch")
@@ -111,10 +157,6 @@ def store_in_opensearch(embeddings):
 # ── DynamoDB Metadata ─────────────────────────────────────────────────────────
 
 def save_metadata(object_key, file_type, blocks, chunks, status, content_hash, error=None):
-    """
-    Save document metadata to DynamoDB.
-    Now includes content_hash for duplicate detection.
-    """
     table = dynamodb.Table(METADATA_TABLE)
     from datetime import datetime, timezone
     table.put_item(
@@ -135,32 +177,24 @@ def save_metadata(object_key, file_type, blocks, chunks, status, content_hash, e
 # ── Lambda Handler ────────────────────────────────────────────────────────────
 
 def lambda_handler(event, context):
-    """
-    Main Lambda handler - triggered by SQS.
-    Each SQS message contains an S3 event notification.
-    """
     processed = []
     failed = []
     skipped = []
 
     for record in event['Records']:
         try:
-            # Parse SQS message
             body = json.loads(record['body'])
 
-            # Skip S3 test events
             if 'Event' in body and body['Event'] == 's3:TestEvent':
                 print("Skipping S3 test event")
                 continue
 
-            # Extract S3 details
             s3_event = body['Records'][0]
             bucket_name = s3_event['s3']['bucket']['name']
             object_key = s3_event['s3']['object']['key']
 
             print(f"Processing file: {object_key} from bucket: {bucket_name}")
 
-            # Process the file
             result = process_file(bucket_name, object_key)
 
             if result.get('skipped'):
@@ -171,7 +205,7 @@ def lambda_handler(event, context):
         except Exception as e:
             print(f"Error processing record: {str(e)}")
             failed.append(str(e))
-            raise  # Re-raise so SQS can retry
+            raise
 
     return {
         'statusCode': 200,
@@ -184,28 +218,16 @@ def lambda_handler(event, context):
 # ── File Processing ───────────────────────────────────────────────────────────
 
 def process_file(bucket_name, object_key):
-    """
-    Download file from S3, check for duplicates, then parse/chunk/embed.
-
-    Duplicate detection flow:
-      1. Download file bytes
-      2. Compute SHA-256 hash
-      3. Query DynamoDB GSI for existing hash
-      4a. Hash found → log and skip (no Bedrock calls, no OpenSearch writes)
-      4b. Hash not found → full ingestion pipeline
-    """
-    # Download file to temp location
     with tempfile.NamedTemporaryFile(delete=False) as tmp_file:
         tmp_path = tmp_file.name
         s3_client.download_file(bucket_name, object_key, tmp_path)
         print(f"Downloaded to: {tmp_path}")
 
     try:
-        # Read file bytes
         with open(tmp_path, 'rb') as f:
             file_bytes = f.read()
 
-        # ── DUPLICATE DETECTION ──────────────────────────────────────────
+        # Duplicate detection
         content_hash = compute_hash(file_bytes)
         print(f"Computed SHA-256 hash: {content_hash}")
 
@@ -222,7 +244,6 @@ def process_file(bucket_name, object_key):
                 'duplicate_of': existing['document_id'],
                 'content_hash': content_hash
             }
-        # ── END DUPLICATE DETECTION ──────────────────────────────────────
 
         # Detect file type
         result = detect(file_bytes, object_key.split('/')[-1])
@@ -239,14 +260,15 @@ def process_file(bucket_name, object_key):
             c.source_key = object_key
         print(f"Created {len(chunks)} chunks")
 
-        # Generate embeddings
+        # Generate embeddings + HyQ questions
+        print("Generating embeddings and HyQ questions...")
         embeddings = embed_chunks(chunks)
-        print(f"Generated {len(embeddings)} embeddings")
+        print(f"Generated {len(embeddings)} embeddings with HyQ questions")
 
         # Store in OpenSearch
         store_in_opensearch(embeddings)
 
-        # Save metadata with content_hash
+        # Save metadata
         save_metadata(
             object_key=object_key,
             file_type=file_type,
@@ -290,5 +312,4 @@ def process_file(bucket_name, object_key):
         raise
 
     finally:
-        # Always clean up temp file
         os.unlink(tmp_path)
