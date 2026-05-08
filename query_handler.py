@@ -10,6 +10,14 @@ bedrock_client = boto3.client('bedrock-runtime',
 
 OPENSEARCH_ENDPOINT = get_opensearch_endpoint()
 
+# ── CORS Headers ──────────────────────────────────────────────────────────────
+CORS_HEADERS = {
+    'Content-Type': 'application/json',
+    'Access-Control-Allow-Origin': '*',
+    'Access-Control-Allow-Headers': 'Content-Type,x-api-key,Authorization',
+    'Access-Control-Allow-Methods': 'POST,OPTIONS'
+}
+
 def get_opensearch_client():
     credentials = boto3.Session().get_credentials()
     awsauth = AWS4Auth(
@@ -35,26 +43,42 @@ def embed_question(question):
     result = json.loads(response['body'].read())
     return result['embedding']
 
-def search_opensearch(question_vector, top_k=5):
+def search_opensearch(question, question_vector, top_k=5):
     client = get_opensearch_client()
     query = {
         "size": top_k,
         "query": {
-            "knn": {
-                "embedding": {
-                    "vector": question_vector,
-                    "k": top_k
-                }
+            "hybrid": {
+                "queries": [
+                    {
+                        "match": {
+                            "text": {
+                                "query": question,
+                                "boost": 1.0
+                            }
+                        }
+                    },
+                    {
+                        "knn": {
+                            "embedding": {
+                                "vector": question_vector,
+                                "k": top_k
+                            }
+                        }
+                    }
+                ]
             }
         },
         "_source": ["text", "source_key", "page", "chunk_index"]
     }
-    response = client.search(index='rag-chunks', body=query)
+    response = client.search(
+        index='rag-chunks',
+        body=query,
+        params={"search_pipeline": "hybrid-search-pipeline"}
+    )
     return response['hits']['hits']
 
-
 def generate_answer(question, chunks):
-    # Build context from chunks
     context = "\n\n".join([
         f"Source: {chunk['source']} (Page {chunk['page']})\n{chunk['text']}"
         for chunk in chunks
@@ -88,20 +112,29 @@ Answer:"""
     return result['output']['message']['content'][0]['text']
 
 def lambda_handler(event, context):
+
+    # ── Handle OPTIONS preflight request (browser sends this before POST) ──
+    if event.get('httpMethod') == 'OPTIONS':
+        return {
+            'statusCode': 200,
+            'headers': CORS_HEADERS,
+            'body': ''
+        }
+
     # Handle both proxy and non-proxy integration
     if isinstance(event.get('body'), str):
         body = json.loads(event.get('body', '{}'))
     elif isinstance(event.get('body'), dict):
         body = event.get('body', {})
     else:
-        body = event  # direct invocation
+        body = event
 
     question = body.get('question', '')
 
     if not question:
         return {
             'statusCode': 400,
-            'headers': {'Content-Type': 'application/json'},
+            'headers': CORS_HEADERS,
             'body': json.dumps({'error': 'No question provided'})
         }
 
@@ -112,7 +145,7 @@ def lambda_handler(event, context):
     print(f"Question embedded")
 
     # Search OpenSearch
-    hits = search_opensearch(question_vector)
+    hits = search_opensearch(question, question_vector)
     print(f"Found {len(hits)} results")
 
     # Format chunks
@@ -131,7 +164,7 @@ def lambda_handler(event, context):
 
     return {
         'statusCode': 200,
-        'headers': {'Content-Type': 'application/json'},
+        'headers': CORS_HEADERS,
         'body': json.dumps({
             'question': question,
             'answer': answer,

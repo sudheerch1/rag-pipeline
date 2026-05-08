@@ -10,18 +10,30 @@ auth = HTTPBasicAuth(username, password)
 print(f"Connecting to: {endpoint}")
 print(f"Username: {username}")
 
-# Index mapping
+# Index mapping with cosine similarity
 index_body = {
     "mappings": {
         "properties": {
             "text": {"type": "text"},
             "embedding": {
                 "type": "knn_vector",
-                "dimension": 1536
+                "dimension": 1536,
+                "method": {
+                    "name": "hnsw",
+                    "space_type": "cosinesimil",   # ← cosine similarity
+                    "engine": "faiss",
+                    "parameters": {
+                        "ef_construction": 128,
+                        "m": 24
+                    }
+                }
             },
             "source_key": {"type": "keyword"},
             "page": {"type": "integer"},
-            "chunk_index": {"type": "integer"}
+            "chunk_index": {"type": "integer"},
+            "hyq_questions": {"type": "text"},     # ← for HyQ (next step)
+            "section": {"type": "keyword"},        # ← for section attribution
+            "paragraph": {"type": "integer"}       # ← for paragraph attribution
         }
     },
     "settings": {
@@ -37,6 +49,5 @@ response = requests.put(
     json=index_body,
     headers={"Content-Type": "application/json"}
 )
-
 print(f"Status: {response.status_code}")
 print(f"Response: {response.text}")
