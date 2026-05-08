@@ -44,6 +44,14 @@ def embed_question(question):
     return result['embedding']
 
 def search_opensearch(question, question_vector, top_k=5):
+    """
+    Hybrid search combining:
+    - BM25 text search on both 'text' and 'hyq_questions' fields
+      (hyq_questions boosted 2x for better question-to-question matching)
+    - KNN vector search for semantic similarity
+
+    Uses hybrid-search-pipeline for score normalization and combination.
+    """
     client = get_opensearch_client()
     query = {
         "size": top_k,
@@ -55,7 +63,7 @@ def search_opensearch(question, question_vector, top_k=5):
                             "query": question,
                             "fields": [
                                 "text^1.0",
-                                "hyq_questions^2.0"  # ← boost HyQ matches higher
+                                "hyq_questions^2.0"
                             ]
                         }
                     },
@@ -102,9 +110,7 @@ Answer:"""
             "messages": [
                 {
                     "role": "user",
-                    "content": [
-                        {"text": prompt}
-                    ]
+                    "content": [{"text": prompt}]
                 }
             ]
         })
@@ -113,9 +119,10 @@ Answer:"""
     result = json.loads(response['body'].read())
     return result['output']['message']['content'][0]['text']
 
+
 def lambda_handler(event, context):
 
-    # ── Handle OPTIONS preflight request (browser sends this before POST) ──
+    # ── Handle OPTIONS preflight ───────────────────────────────────────────
     if event.get('httpMethod') == 'OPTIONS':
         return {
             'statusCode': 200,
@@ -123,7 +130,7 @@ def lambda_handler(event, context):
             'body': ''
         }
 
-    # Handle both proxy and non-proxy integration
+    # Parse body
     if isinstance(event.get('body'), str):
         body = json.loads(event.get('body', '{}'))
     elif isinstance(event.get('body'), dict):
@@ -142,21 +149,22 @@ def lambda_handler(event, context):
 
     print(f"Question: {question}")
 
-    # Convert question to vector
+    # Embed question for vector search
     question_vector = embed_question(question)
     print(f"Question embedded")
 
-    # Search OpenSearch
+    # Hybrid search (BM25 + KNN + HyQ)
     hits = search_opensearch(question, question_vector)
-    print(f"Found {len(hits)} results")
+    print(f"Hybrid search found {len(hits)} results")
 
-    # Format chunks
+    # Format chunks — include section for attribution
     chunks = []
     for hit in hits:
         chunks.append({
             'text': hit['_source']['text'],
             'source': hit['_source']['source_key'],
             'page': hit['_source'].get('page'),
+            'section': hit['_source'].get('section', ''),   # ← section attribution
             'score': hit['_score']
         })
 
@@ -174,6 +182,7 @@ def lambda_handler(event, context):
                 {
                     'source': c['source'],
                     'page': c['page'],
+                    'section': c.get('section', ''),        # ← safe .get()
                     'score': c['score']
                 }
                 for c in chunks
