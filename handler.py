@@ -154,6 +154,28 @@ def store_in_opensearch(embeddings):
     print(f"Stored {len(embeddings)} embeddings in OpenSearch")
 
 
+# ── Delete Stale Chunks ───────────────────────────────────────────────────────
+
+def delete_old_chunks(source_key):
+    client = get_opensearch_client()
+    delete_query = {
+        "query": {
+            "term": {
+                "source_key": source_key
+            }
+        }
+    }
+    try:
+        response = client.delete_by_query(
+            index='rag-chunks',
+            body=delete_query
+        )
+        deleted_count = response.get('deleted', 0)
+        print(f"Deleted {deleted_count} old chunks for {source_key}")
+    except Exception as e:
+        print(f"Warning: Could not delete old chunks for {source_key}: {e}")
+
+
 # ── DynamoDB Metadata ─────────────────────────────────────────────────────────
 
 def save_metadata(object_key, file_type, blocks, chunks, status, content_hash, error=None):
@@ -250,6 +272,25 @@ def process_file(bucket_name, object_key):
         file_type = result.parser_key
         print(f"Detected file type: {file_type}")
 
+        # Handle unrecognised or corrupted files cleanly
+        if file_type == 'unknown':
+            print(f"Unrecognised file type: {object_key}, confidence: {result.confidence}")
+            save_metadata(
+                object_key=object_key,
+                file_type='unknown',
+                blocks=0,
+                chunks=0,
+                status='rejected',
+                content_hash=content_hash,
+                error=f"unknown_file_type:{result.confidence}"
+            )
+            return {
+                'skipped': True,
+                'source_key': object_key,
+                'reason': 'unknown_file_type',
+                'confidence': result.confidence
+            }
+
         # Parse file into blocks
         blocks = parse(file_bytes, file_type)
         print(f"Parsed {len(blocks)} blocks")
@@ -264,6 +305,9 @@ def process_file(bucket_name, object_key):
         print("Generating embeddings and HyQ questions...")
         embeddings = embed_chunks(chunks)
         print(f"Generated {len(embeddings)} embeddings with HyQ questions")
+
+        # Delete old chunks for this file before indexing new ones
+        delete_old_chunks(object_key)
 
         # Store in OpenSearch
         store_in_opensearch(embeddings)
