@@ -6,6 +6,7 @@ No parser knows about chunking. No parser knows about other parsers.
 import io
 import csv as csv_mod
 import json
+import re
 from typing import List
 
 from models import ParsedBlock, BlockType
@@ -15,17 +16,80 @@ from models import ParsedBlock, BlockType
 
 def parse_pdf(file_bytes: bytes) -> List[ParsedBlock]:
     import pypdf
-    import io
+    import re
+
     blocks = []
     reader = pypdf.PdfReader(io.BytesIO(file_bytes))
+    current_section = ""
+
+    # Patterns to skip — journal headers, page numbers, case citations
+    SKIP_PATTERNS = re.compile(
+        r'^(Page \d|CONNECTICUT LAW|June \d|January \d|February \d|'
+        r'March \d|April \d|May \d|July \d|August \d|September \d|'
+        r'October \d|November \d|December \d|\d+ Conn\.|'
+        r'Johnson\s*v\.\s*Superior)',
+        re.IGNORECASE
+    )
+
     for i, page in enumerate(reader.pages):
         text = page.extract_text() or ""
-        if text.strip():
-            blocks.append(ParsedBlock(
-                text=text,
-                block_type=BlockType.TEXT,
-                page=i + 1
-            ))
+        if not text.strip():
+            continue
+
+        lines = [l.strip() for l in text.split('\n') if l.strip()]
+        current_para_lines = []
+
+        def flush_paragraph():
+            nonlocal current_para_lines
+            if not current_para_lines:
+                return
+            para_text = ' '.join(current_para_lines)
+            if len(para_text.split()) >= 10:
+                blocks.append(ParsedBlock(
+                    text       = para_text,
+                    block_type = BlockType.TEXT,
+                    page       = i + 1,
+                    section    = current_section,
+                ))
+            current_para_lines = []
+
+        for line in lines:
+            words = line.split()
+            word_count = len(words)
+
+            # Skip journal headers and page numbers
+            if SKIP_PATTERNS.match(line):
+                flush_paragraph()
+                continue
+
+            # Short line — potential heading or noise
+            if word_count <= 5:
+                # Check if it looks like a heading
+                is_titlecase = line.istitle()
+                is_uppercase = line.isupper()
+                has_no_digits = not any(c.isdigit() for c in line)
+
+                if (is_titlecase or is_uppercase) and has_no_digits:
+                    flush_paragraph()
+                    current_section = line
+                    blocks.append(ParsedBlock(
+                        text       = line,
+                        block_type = BlockType.HEADING,
+                        page       = i + 1,
+                        section    = current_section,
+                    ))
+                else:
+                    # Short line but not a heading — skip noise
+                    # e.g. "(SC 21074)", "NUMBER NINETEEN"
+                    flush_paragraph()
+                continue
+
+            # Long line — paragraph content
+            current_para_lines.append(line)
+
+        # Flush remaining paragraph at end of page
+        flush_paragraph()
+
     return blocks
 
 # ── DOCX ─────────────────────────────────────────────────────────────────────
@@ -42,14 +106,11 @@ def parse_docx(file_bytes: bytes) -> List[ParsedBlock]:
     blocks: List[ParsedBlock] = []
     current_section = None
 
-    # python-docx exposes paragraphs and tables separately, but we can
-    # iterate the raw XML body children to preserve document order.
     body = doc.element.body
     for child in body:
         tag = child.tag.split('}')[-1]  # strip namespace
 
         if tag == 'p':
-            # Reconstruct paragraph from python-docx object
             from docx.text.paragraph import Paragraph
             para = Paragraph(child, doc)
             text = para.text.strip()
@@ -114,7 +175,6 @@ def parse_xlsx(file_bytes: bytes) -> List[ParsedBlock]:
         rows = []
         for i, row in enumerate(ws.iter_rows(values_only=True)):
             cells = [str(c) if c is not None else "" for c in row]
-            # Skip completely empty rows
             if any(c.strip() for c in cells):
                 rows.append(" | ".join(cells))
 
@@ -147,7 +207,6 @@ def parse_csv(file_bytes: bytes) -> List[ParsedBlock]:
     batch: List[str] = []
 
     for i, row in enumerate(reader):
-        # Serialise as "key: value, key: value …" for better embedding
         parts = [f"{k}: {v}" for k, v in row.items() if v and v.strip()]
         sentence = "; ".join(parts)
         if sentence:
@@ -192,7 +251,6 @@ def parse_pptx(file_bytes: bytes) -> List[ParsedBlock]:
             if not shape.has_text_frame:
                 continue
 
-            # Detect title placeholder
             if shape.shape_type == 13 or (hasattr(shape, "placeholder_format") and
                shape.placeholder_format and shape.placeholder_format.idx == 0):
                 slide_title = shape.text_frame.text.strip()
@@ -210,7 +268,6 @@ def parse_pptx(file_bytes: bytes) -> List[ParsedBlock]:
                 section=slide_title or f"Slide {slide_num}",
             ))
 
-        # Speaker notes
         if slide.has_notes_slide:
             notes_text = slide.notes_slide.notes_text_frame.text.strip()
             if notes_text:
@@ -235,7 +292,6 @@ def parse_html(file_bytes: bytes) -> List[ParsedBlock]:
 
     soup = BeautifulSoup(file_bytes, "lxml")
 
-    # Remove noise elements
     for tag in soup(["script", "style", "nav", "footer", "header", "aside"]):
         tag.decompose()
 
@@ -357,7 +413,7 @@ PARSER_MAP = {
     "html":     parse_html,
     "json":     parse_json,
     "text":     parse_text,
-    "markdown": parse_text,   # same paragraph splitting works for markdown
+    "markdown": parse_text,
 }
 
 

@@ -24,6 +24,7 @@ import re
 import json
 import boto3
 import os
+import time       # ← add this
 from typing import List, Optional
 
 from models import ParsedBlock, Chunk, BlockType
@@ -38,7 +39,7 @@ def count_tokens(text: str) -> int:
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-MAX_TOKENS     = 512
+MAX_TOKENS     = 448  # 448 content + 64 overlap = 512 max final chunk size
 OVERLAP_TOKENS = 64
 MIN_TOKENS     = 30
 
@@ -67,6 +68,23 @@ def get_embedding_bedrock(text: str, bedrock_client) -> List[float]:
     result = json.loads(response['body'].read())
     return result['embedding']
 
+
+def get_embedding_with_retry(text: str, bedrock_client, max_retries: int = 3) -> List[float]:
+    """
+    Retry wrapper for Bedrock embeddings with exponential backoff.
+    Retries up to max_retries times before raising.
+    On final failure: raises → triggers chunk_semantic() fallback to recursive.
+    """
+    for attempt in range(max_retries):
+        try:
+            return get_embedding_bedrock(text, bedrock_client)
+        except Exception as e:
+            if attempt == max_retries - 1:
+                raise
+            wait = 2 ** attempt
+            print(f"[semantic chunker] Embedding attempt {attempt + 1} failed, "
+                  f"retrying in {wait}s: {e}")
+            time.sleep(wait)
 
 def cosine_similarity(a: List[float], b: List[float]) -> float:
     """Compute cosine similarity between two vectors."""
@@ -265,11 +283,11 @@ def chunk_semantic(
         embeddings = []
         for i, block in enumerate(blocks):
             try:
-                emb = get_embedding_bedrock(block.text, bedrock)
+                emb = get_embedding_with_retry(block.text, bedrock)
                 embeddings.append(emb)
             except Exception as e:
-                print(f"[semantic chunker] Block {i} embedding failed: {e}, using zero vector")
-                embeddings.append([0.0] * 1536)
+                print(f"[semantic chunker] Block {i} failed after all retries: {e}")
+                raise
 
         print(f"[semantic chunker] Embeddings generated, grouping by similarity...")
 
