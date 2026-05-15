@@ -3,6 +3,7 @@ import boto3
 import os
 import tempfile
 import hashlib
+import time
 from detector import detect
 from parsers import parse
 from chunker import chunk
@@ -71,7 +72,7 @@ def generate_hyq_questions(chunk_text: str) -> list[str]:
 Return ONLY the questions, one per line, with no numbering, bullets, or extra text.
 
 Passage:
-{chunk_text[:1000]}
+{chunk_text}
 
 Questions:"""
 
@@ -100,6 +101,23 @@ Questions:"""
         return []
 
 
+
+def embed_with_retry(text: str, max_retries: int = 3) -> list:
+    for attempt in range(max_retries):
+        try:
+            response = bedrock_client.invoke_model(
+                modelId='amazon.titan-embed-text-v1',
+                body=json.dumps({'inputText': text})
+            )
+            return json.loads(response['body'].read())['embedding']
+        except Exception as e:
+            if attempt == max_retries - 1:
+                raise
+            wait = 2 ** attempt
+            print(f"[embed_chunks] Attempt {attempt + 1} failed, retrying in {wait}s: {e}")
+            time.sleep(wait)
+
+
 # ── Embedding ─────────────────────────────────────────────────────────────────
 
 def embed_chunks(chunks):
@@ -109,12 +127,9 @@ def embed_chunks(chunks):
     """
     embeddings = []
     for i, chunk in enumerate(chunks):
-        # Generate embedding
-        response = bedrock_client.invoke_model(
-            modelId='amazon.titan-embed-text-v1',
-            body=json.dumps({'inputText': chunk.text})
-        )
-        result = json.loads(response['body'].read())
+
+        # Generate embedding (with retry + exponential backoff)
+        embedding = embed_with_retry(chunk.text)
 
         # Generate HyQ questions
         hyq_questions = generate_hyq_questions(chunk.text)
@@ -124,7 +139,7 @@ def embed_chunks(chunks):
         embeddings.append({
             'chunk_index': chunk.chunk_index,
             'text': chunk.text,
-            'embedding': result['embedding'],
+            'embedding': embedding,
             'token_count': chunk.token_count,
             'page': chunk.page,
             'source_key': chunk.source_key,
@@ -291,12 +306,33 @@ def process_file(bucket_name, object_key):
                 'confidence': result.confidence
             }
 
+        
         # Parse file into blocks
         blocks = parse(file_bytes, file_type)
         print(f"Parsed {len(blocks)} blocks")
 
+        # Guard: no blocks means parser got nothing useful from the file
+        if not blocks:
+            print(f"No blocks extracted from {object_key}, marking as failed")
+            save_metadata(
+                object_key=object_key,
+                file_type=file_type,
+                blocks=0,
+                chunks=0,
+                status='failed',
+                content_hash=content_hash,
+                error='no_blocks_extracted'
+            )
+            return {
+                'skipped': True,
+                'source_key': object_key,
+                'reason': 'no_blocks_extracted'
+            }
+
         # Chunk blocks
         chunks = chunk(blocks, file_type)
+             
+        
         for c in chunks:
             c.source_key = object_key
         print(f"Created {len(chunks)} chunks")
@@ -350,7 +386,7 @@ def process_file(bucket_name, object_key):
             blocks=0,
             chunks=0,
             status='failed',
-            content_hash=content_hash if 'content_hash' in dir() else 'unknown',
+            content_hash=locals().get('content_hash', 'unknown'),
             error=str(e)
         )
         raise
