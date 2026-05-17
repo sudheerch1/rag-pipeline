@@ -10,7 +10,7 @@ from chunker import chunk
 from opensearchpy import OpenSearch, RequestsHttpConnection
 from requests_aws4auth import AWS4Auth
 from config import get_opensearch_endpoint
-from urllib.parse import unquote_plus   # ← ADD THIS
+from urllib.parse import unquote_plus
 from detector import detect
 
 s3_client = boto3.client('s3')
@@ -99,9 +99,8 @@ Questions:"""
         return questions
 
     except Exception as e:
-        print(f"HyQ generation failed for chunk (non-blocking): {str(e)}")
+        print(f"[HyQ] Generation failed for chunk (non-blocking): {str(e)}")
         return []
-
 
 
 def embed_with_retry(text: str, max_retries: int = 3) -> list:
@@ -116,7 +115,7 @@ def embed_with_retry(text: str, max_retries: int = 3) -> list:
             if attempt == max_retries - 1:
                 raise
             wait = 2 ** attempt
-            print(f"[embed_chunks] Attempt {attempt + 1} failed, retrying in {wait}s: {e}")
+            print(f"[Bedrock] Attempt {attempt + 1} failed, retrying in {wait}s: {e}")
             time.sleep(wait)
 
 
@@ -128,7 +127,9 @@ def embed_chunks(chunks):
     Also generates HyQ questions for each chunk.
     """
     embeddings = []
+    total = len(chunks)
     for i, chunk in enumerate(chunks):
+        print(f"  [Embedding] Chunk {i + 1}/{total} | tokens: {chunk.token_count} | page: {chunk.page}")
 
         # Generate embedding (with retry + exponential backoff)
         embedding = embed_with_retry(chunk.text)
@@ -136,7 +137,7 @@ def embed_chunks(chunks):
         # Generate HyQ questions
         hyq_questions = generate_hyq_questions(chunk.text)
         if hyq_questions:
-            print(f"  Chunk {i}: generated {len(hyq_questions)} HyQ questions")
+            print(f"  [HyQ] Chunk {i + 1}: generated {len(hyq_questions)} questions")
 
         embeddings.append({
             'chunk_index': chunk.chunk_index,
@@ -168,7 +169,7 @@ def store_in_opensearch(embeddings):
                 'section': item['section'],
             }
         )
-    print(f"Stored {len(embeddings)} embeddings in OpenSearch")
+    print(f"[OpenSearch] Stored {len(embeddings)} chunks in index: rag-chunks")
 
 
 # ── Delete Stale Chunks ───────────────────────────────────────────────────────
@@ -188,9 +189,12 @@ def delete_old_chunks(source_key):
             body=delete_query
         )
         deleted_count = response.get('deleted', 0)
-        print(f"Deleted {deleted_count} old chunks for {source_key}")
+        if deleted_count > 0:
+            print(f"[OpenSearch] Deleted {deleted_count} stale chunks for: {source_key}")
+        else:
+            print(f"[OpenSearch] No stale chunks found for: {source_key} (first time ingestion)")
     except Exception as e:
-        print(f"Warning: Could not delete old chunks for {source_key}: {e}")
+        print(f"[OpenSearch] Warning: Could not delete old chunks for {source_key}: {e}")
 
 
 # ── DynamoDB Metadata ─────────────────────────────────────────────────────────
@@ -210,12 +214,18 @@ def save_metadata(object_key, file_type, blocks, chunks, status, content_hash, e
             'error': error or 'none'
         }
     )
-    print(f"Metadata saved for: {object_key}")
+    print(f"[DynamoDB] Metadata saved | file: {object_key} | status: {status}")
 
 
 # ── Lambda Handler ────────────────────────────────────────────────────────────
 
 def lambda_handler(event, context):
+    # ── LOG: Pipeline entry point — shows SQS triggered Lambda ──
+    print("=" * 60)
+    print("RAG Ingestion Pipeline — triggered")
+    print(f"Records in batch: {len(event['Records'])}")
+    print("=" * 60)
+
     processed = []
     failed = []
     skipped = []
@@ -225,15 +235,21 @@ def lambda_handler(event, context):
             body = json.loads(record['body'])
 
             if 'Event' in body and body['Event'] == 's3:TestEvent':
-                print("Skipping S3 test event")
+                print("[SQS] Skipping S3 test event")
                 continue
 
             s3_event = body['Records'][0]
             bucket_name = s3_event['s3']['bucket']['name']
-            # CORRECT
             object_key = unquote_plus(s3_event['s3']['object']['key'])
+            file_size = s3_event['s3']['object'].get('size', 0)
+            event_time = s3_event.get('eventTime', 'unknown')
 
-            print(f"Processing file: {object_key} from bucket: {bucket_name}")
+            # ── LOG: Shows the SQS message content — what S3 event arrived ──
+            print(f"[SQS] Message received")
+            print(f"  Bucket     : {bucket_name}")
+            print(f"  File       : {object_key}")
+            print(f"  Size       : {file_size:,} bytes ({round(file_size / 1024, 1)} KB)")
+            print(f"  Event time : {event_time}")
 
             result = process_file(bucket_name, object_key)
 
@@ -243,9 +259,14 @@ def lambda_handler(event, context):
                 processed.append(result)
 
         except Exception as e:
-            print(f"Error processing record: {str(e)}")
+            print(f"[ERROR] Failed to process record: {str(e)}")
             failed.append(str(e))
             raise
+
+    # ── LOG: Final batch summary ──
+    print("=" * 60)
+    print(f"BATCH COMPLETE | processed: {len(processed)} | skipped: {len(skipped)} | failed: {len(failed)}")
+    print("=" * 60)
 
     return {
         'statusCode': 200,
@@ -261,23 +282,27 @@ def process_file(bucket_name, object_key):
     with tempfile.NamedTemporaryFile(delete=False) as tmp_file:
         tmp_path = tmp_file.name
         s3_client.download_file(bucket_name, object_key, tmp_path)
-        print(f"Downloaded to: {tmp_path}")
 
     try:
         with open(tmp_path, 'rb') as f:
             file_bytes = f.read()
 
+        # ── LOG: Step 1 — File downloaded ──
+        print(f"[1/7] File downloaded to /tmp/ ({len(file_bytes):,} bytes)")
+
         # Duplicate detection
         content_hash = compute_hash(file_bytes)
-        print(f"Computed SHA-256 hash: {content_hash}")
+
+        # ── LOG: Step 2 — Hash computed ──
+        print(f"[2/7] SHA-256 hash computed: {content_hash[:20]}...")
 
         existing = check_duplicate(content_hash)
         if existing:
-            print(
-                f"DUPLICATE DETECTED: {object_key} has same content as "
-                f"'{existing['document_id']}' (ingested at {existing['timestamp']}). "
-                f"Skipping ingestion."
-            )
+            # ── LOG: Duplicate detected ──
+            print(f"[SKIP] DUPLICATE DETECTED — same content already ingested")
+            print(f"  Existing file : {existing['document_id']}")
+            print(f"  Ingested at   : {existing['timestamp']}")
+            print(f"  Skipping      : {object_key}")
             return {
                 'skipped': True,
                 'source_key': object_key,
@@ -288,11 +313,13 @@ def process_file(bucket_name, object_key):
         # Detect file type
         result = detect(file_bytes, object_key.split('/')[-1])
         file_type = result.parser_key
-        print(f"Detected file type: {file_type}")
+
+        # ── LOG: Step 3 — File type detected ──
+        print(f"[3/7] File type detected: {file_type} (confidence: {result.confidence})")
 
         # Handle unrecognised or corrupted files cleanly
         if file_type == 'unknown':
-            print(f"Unrecognised file type: {object_key}, confidence: {result.confidence}")
+            print(f"[SKIP] Unrecognised file type for: {object_key}")
             save_metadata(
                 object_key=object_key,
                 file_type='unknown',
@@ -309,14 +336,15 @@ def process_file(bucket_name, object_key):
                 'confidence': result.confidence
             }
 
-        
         # Parse file into blocks
         blocks = parse(file_bytes, file_type)
-        print(f"Parsed {len(blocks)} blocks")
+
+        # ── LOG: Step 4 — Parsed into blocks ──
+        print(f"[4/7] Parsed into {len(blocks)} paragraph-level blocks")
 
         # Guard: no blocks means parser got nothing useful from the file
         if not blocks:
-            print(f"No blocks extracted from {object_key}, marking as failed")
+            print(f"[ERROR] No blocks extracted from {object_key} — marking as failed")
             save_metadata(
                 object_key=object_key,
                 file_type=file_type,
@@ -334,22 +362,28 @@ def process_file(bucket_name, object_key):
 
         # Chunk blocks
         chunks = chunk(blocks, file_type)
-             
-        
         for c in chunks:
             c.source_key = object_key
-        print(f"Created {len(chunks)} chunks")
+
+        # ── LOG: Step 5 — Chunks created ──
+        print(f"[5/7] Semantic chunking complete → {len(chunks)} chunks from {len(blocks)} blocks")
 
         # Generate embeddings + HyQ questions
-        print("Generating embeddings and HyQ questions...")
+        print(f"[6/7] Generating Titan embeddings + HyQ questions for {len(chunks)} chunks...")
         embeddings = embed_chunks(chunks)
-        print(f"Generated {len(embeddings)} embeddings with HyQ questions")
+        total_hyq = sum(1 for e in embeddings if e['hyq_questions']) * 3
+
+        # ── LOG: Step 6 — Embeddings done ──
+        print(f"[6/7] Done — {len(embeddings)} embeddings | ~{total_hyq} HyQ questions generated")
 
         # Delete old chunks for this file before indexing new ones
         delete_old_chunks(object_key)
 
         # Store in OpenSearch
         store_in_opensearch(embeddings)
+
+        # ── LOG: Step 7 — OpenSearch indexed ──
+        print(f"[7/7] Chunks indexed in OpenSearch — pipeline complete!")
 
         # Save metadata
         save_metadata(
@@ -370,7 +404,19 @@ def process_file(bucket_name, object_key):
             Body=json.dumps(chunks_data, indent=2),
             ContentType='application/json'
         )
-        print(f"Saved chunks to: {output_key}")
+        print(f"[S3] Chunks JSON backed up to: s3://{PROCESSED_BUCKET}/{output_key}")
+
+        # ── LOG: Final pipeline summary ──
+        print("-" * 60)
+        print(f"PIPELINE SUMMARY")
+        print(f"  File     : {object_key}")
+        print(f"  Type     : {file_type}")
+        print(f"  Blocks   : {len(blocks)}")
+        print(f"  Chunks   : {len(chunks)}")
+        print(f"  HyQ Qs   : ~{total_hyq} (3 per chunk)")
+        print(f"  Hash     : {content_hash[:20]}...")
+        print(f"  Status   : completed ✅")
+        print("-" * 60)
 
         return {
             'source_key': object_key,
@@ -382,7 +428,7 @@ def process_file(bucket_name, object_key):
         }
 
     except Exception as e:
-        print(f"Error processing file: {str(e)}")
+        print(f"[ERROR] Pipeline failed for {object_key}: {str(e)}")
         save_metadata(
             object_key=object_key,
             file_type='unknown',
