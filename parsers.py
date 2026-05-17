@@ -97,18 +97,21 @@ def parse_pdf(file_bytes: bytes) -> List[ParsedBlock]:
 def parse_docx(file_bytes: bytes) -> List[ParsedBlock]:
     """
     Walks paragraphs and tables in document order.
-    Detects headings via paragraph style name so section context is preserved.
+    Detects headings via style name OR bold short lines.
+    page = simulated page number (every 40 paragraphs = 1 page).
+    paragraph = sequential paragraph index within document.
     """
     from docx import Document
-    from docx.oxml.ns import qn
 
     doc = Document(io.BytesIO(file_bytes))
     blocks: List[ParsedBlock] = []
-    current_section = None
+    current_section = ""
+    para_index = 0
+    PARAS_PER_PAGE = 40  # approximate simulation
 
     body = doc.element.body
     for child in body:
-        tag = child.tag.split('}')[-1]  # strip namespace
+        tag = child.tag.split('}')[-1]
 
         if tag == 'p':
             from docx.text.paragraph import Paragraph
@@ -118,26 +121,42 @@ def parse_docx(file_bytes: bytes) -> List[ParsedBlock]:
                 continue
 
             style_name = para.style.name if para.style else ""
+            simulated_page = (para_index // PARAS_PER_PAGE) + 1
 
-            if style_name.startswith("Heading"):
+            # Detect heading: by style OR bold short line (<=8 words)
+            is_heading_style = style_name.startswith("Heading")
+            is_bold_short = (
+                len(text.split()) <= 8 and
+                para.runs and
+                all(run.bold for run in para.runs if run.text.strip())
+            )
+
+            if is_heading_style or is_bold_short:
                 current_section = text
                 blocks.append(ParsedBlock(
                     text=text,
                     block_type=BlockType.HEADING,
+                    page=simulated_page,
                     section=current_section,
+                    row_index=para_index,
                 ))
             elif style_name in ("List Paragraph", "List Bullet", "List Number"):
                 blocks.append(ParsedBlock(
                     text=text,
                     block_type=BlockType.LIST_ITEM,
+                    page=simulated_page,
                     section=current_section,
+                    row_index=para_index,
                 ))
             else:
                 blocks.append(ParsedBlock(
                     text=text,
                     block_type=BlockType.TEXT,
+                    page=simulated_page,
                     section=current_section,
+                    row_index=para_index,
                 ))
+            para_index += 1
 
         elif tag == 'tbl':
             from docx.table import Table
@@ -148,15 +167,17 @@ def parse_docx(file_bytes: bytes) -> List[ParsedBlock]:
                 rows.append(" | ".join(cells))
             table_text = "\n".join(rows)
             if table_text.strip():
+                simulated_page = (para_index // PARAS_PER_PAGE) + 1
                 blocks.append(ParsedBlock(
                     text=table_text,
                     block_type=BlockType.TABLE,
+                    page=simulated_page,
                     section=current_section,
+                    row_index=para_index,
                 ))
+            para_index += 1
 
     return blocks
-
-
 # ── XLSX ─────────────────────────────────────────────────────────────────────
 
 def parse_xlsx(file_bytes: bytes) -> List[ParsedBlock]:

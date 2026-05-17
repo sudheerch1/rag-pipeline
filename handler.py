@@ -10,6 +10,8 @@ from chunker import chunk
 from opensearchpy import OpenSearch, RequestsHttpConnection
 from requests_aws4auth import AWS4Auth
 from config import get_opensearch_endpoint
+from urllib.parse import unquote_plus   # ← ADD THIS
+from detector import detect
 
 s3_client = boto3.client('s3')
 bedrock_client = boto3.client('bedrock-runtime', region_name=os.environ.get('AWS_REGION', 'us-east-1'))
@@ -228,7 +230,8 @@ def lambda_handler(event, context):
 
             s3_event = body['Records'][0]
             bucket_name = s3_event['s3']['bucket']['name']
-            object_key = s3_event['s3']['object']['key']
+            # CORRECT
+            object_key = unquote_plus(s3_event['s3']['object']['key'])
 
             print(f"Processing file: {object_key} from bucket: {bucket_name}")
 
