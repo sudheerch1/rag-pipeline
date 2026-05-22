@@ -1,0 +1,234 @@
+# query_graph.py
+import json
+import boto3
+import os
+from langchain_core.prompts import PromptTemplate
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.runnables import RunnableLambda, RunnablePassthrough
+
+from llm_clients import get_embeddings, get_llm
+from opensearch_client import get_opensearch_client
+
+# ── CORS Headers ──────────────────────────────────────────────────────────────
+CORS_HEADERS = {
+    'Content-Type': 'application/json',
+    'Access-Control-Allow-Origin': '*',
+    'Access-Control-Allow-Headers': 'Content-Type,x-api-key,Authorization',
+    'Access-Control-Allow-Methods': 'POST,OPTIONS'
+}
+
+# ── Bedrock client (reranking only — Cohere not in LangChain-AWS yet) ─────────
+bedrock_client = boto3.client('bedrock-runtime',
+    region_name=os.environ.get('AWS_REGION', 'us-east-1'))
+
+
+# ── Step 1: HyDE ──────────────────────────────────────────────────────────────
+
+hyde_prompt = PromptTemplate.from_template("""Write a short factual passage that would directly answer this question.
+Write as if it's extracted from a legal document. 2-3 sentences only.
+
+Question: {question}
+
+Passage:""")
+
+hyde_chain = hyde_prompt | get_llm() | StrOutputParser()
+
+def run_hyde(state: dict) -> dict:
+    try:
+        hyde_text = hyde_chain.invoke({"question": state["question"]})
+        print(f"HyDE generated: {hyde_text[:100]}...")
+        state["hyde_text"] = hyde_text
+    except Exception as e:
+        print(f"HyDE failed (non-blocking): {e}")
+        state["hyde_text"] = state["question"]
+    return state
+
+
+# ── Step 2: Embed + Hybrid Search ─────────────────────────────────────────────
+
+def run_search(state: dict) -> dict:
+    question_vector = get_embeddings().embed_query(state["hyde_text"])
+    question = state["question"]
+    top_k = 10
+
+    query = {
+        "size": top_k,
+        "query": {
+            "hybrid": {
+                "queries": [
+                    {
+                        "multi_match": {
+                            "query": question,
+                            "fields": ["text^1.0", "hyq_questions^2.0"]
+                        }
+                    },
+                    {
+                        "knn": {
+                            "embedding": {
+                                "vector": question_vector,
+                                "k": top_k
+                            }
+                        }
+                    }
+                ]
+            }
+        },
+        "_source": ["text", "source_key", "page", "chunk_index", "hyq_questions", "section"]
+    }
+
+    client = get_opensearch_client()
+    response = client.search(
+        index='rag-chunks',
+        body=query,
+        params={"search_pipeline": "hybrid-search-pipeline"}
+    )
+
+    hits = response['hits']['hits']
+    print(f"Hybrid search found {len(hits)} candidates")
+
+    state["chunks"] = [
+        {
+            'text': h['_source']['text'],
+            'source': h['_source']['source_key'],
+            'page': h['_source'].get('page'),
+            'section': h['_source'].get('section', ''),
+            'score': h['_score']
+        }
+        for h in hits
+    ]
+    return state
+
+
+# ── Step 3: Rerank (Cohere — direct Bedrock, no LangChain wrapper) ────────────
+
+def run_rerank(state: dict) -> dict:
+    chunks = state["chunks"]
+    question = state["question"]
+    top_n = 5
+
+    if not chunks:
+        return state
+
+    try:
+        response = bedrock_client.invoke_model(
+            modelId='cohere.rerank-v3-5:0',
+            body=json.dumps({
+                "query": question,
+                "documents": [c['text'] for c in chunks],
+                "top_n": top_n,
+                "api_version": 2
+            })
+        )
+        results = json.loads(response['body'].read()).get('results', [])
+        reranked = []
+        for item in results:
+            c = chunks[item['index']].copy()
+            c['rerank_score'] = item['relevance_score']
+            c['original_score'] = c['score']
+            c['score'] = item['relevance_score']
+            reranked.append(c)
+        print(f"Reranked {len(chunks)} → top {len(reranked)}")
+        state["chunks"] = reranked
+    except Exception as e:
+        print(f"Reranking failed (non-blocking): {e}")
+        state["chunks"] = chunks[:top_n]
+
+    return state
+
+
+# ── Step 4: Deduplicate by page ───────────────────────────────────────────────
+
+def run_dedup(state: dict) -> dict:
+    seen, unique = set(), []
+    for c in state["chunks"]:
+        key = f"{c['source']}_{c['page']}"
+        if key not in seen:
+            seen.add(key)
+            unique.append(c)
+    print(f"After deduplication: {len(unique)} unique chunks")
+    state["chunks"] = unique
+    return state
+
+
+# ── Step 5: Answer Generation ─────────────────────────────────────────────────
+
+answer_prompt = PromptTemplate.from_template("""You are a helpful assistant. Answer the question based only on the provided context.
+If the answer is not in the context, say "I cannot find this information in the provided documents."
+
+Context:
+{context}
+
+Question: {question}
+
+Answer:""")
+
+answer_chain = answer_prompt | get_llm() | StrOutputParser()
+
+def run_answer(state: dict) -> dict:
+    context = "\n\n".join([
+        f"Source: {c['source']} (Page {c['page']})\n{c['text']}"
+        for c in state["chunks"]
+    ])
+    state["answer"] = answer_chain.invoke({
+        "context": context,
+        "question": state["question"]
+    })
+    print("Answer generated")
+    return state
+
+
+# ── Full pipeline (LCEL chain of RunnableLambdas) ─────────────────────────────
+
+query_pipeline = (
+    RunnableLambda(run_hyde)
+    | RunnableLambda(run_search)
+    | RunnableLambda(run_rerank)
+    | RunnableLambda(run_dedup)
+    | RunnableLambda(run_answer)
+)
+
+
+# ── Lambda handler ────────────────────────────────────────────────────────────
+
+def lambda_handler(event, context):
+
+    if event.get('httpMethod') == 'OPTIONS':
+        return {'statusCode': 200, 'headers': CORS_HEADERS, 'body': ''}
+
+    if isinstance(event.get('body'), str):
+        body = json.loads(event.get('body', '{}'))
+    elif isinstance(event.get('body'), dict):
+        body = event.get('body', {})
+    else:
+        body = event
+
+    question = body.get('question', '')
+
+    if not question:
+        return {
+            'statusCode': 400,
+            'headers': CORS_HEADERS,
+            'body': json.dumps({'error': 'No question provided'})
+        }
+
+    print(f"Question: {question}")
+
+    state = query_pipeline.invoke({"question": question})
+
+    return {
+        'statusCode': 200,
+        'headers': CORS_HEADERS,
+        'body': json.dumps({
+            'question': state["question"],
+            'answer': state["answer"],
+            'sources': [
+                {
+                    'source': c['source'],
+                    'page': c['page'],
+                    'section': c.get('section', ''),
+                    'score': c['score']
+                }
+                for c in state["chunks"]
+            ]
+        })
+    }

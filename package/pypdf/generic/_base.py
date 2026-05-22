@@ -136,8 +136,8 @@ class PdfObject(PdfObjectProtocol):
         )
 
     def _reference_clone(
-        self, clone: Any, pdf_dest: PdfWriterProtocol, force_duplicate: bool = False
-    ) -> PdfObjectProtocol:
+        self, clone: "PdfObject", pdf_dest: PdfWriterProtocol, force_duplicate: bool = False
+    ) -> "PdfObject":
         """
         Reference the object within the _objects of pdf_dest only if
         indirect_reference attribute exists (which means the objects was
@@ -153,7 +153,11 @@ class PdfObject(PdfObjectProtocol):
 
         """
         try:
-            if not force_duplicate and clone.indirect_reference.pdf == pdf_dest:
+            if (
+                not force_duplicate
+                and clone.indirect_reference is not None
+                and clone.indirect_reference.pdf == pdf_dest
+            ):
                 return clone
         except Exception:
             pass
@@ -182,7 +186,7 @@ class PdfObject(PdfObjectProtocol):
                 obj = pdf_dest.get_object(
                     pdf_dest._id_translated[id(ind.pdf)][ind.idnum]
                 )
-                assert obj is not None
+                assert isinstance(obj, PdfObject), "mypy"
                 return obj
             pdf_dest._id_translated[id(ind.pdf)][ind.idnum] = i
         try:
@@ -252,6 +256,8 @@ class NullObject(PdfObject):
 
 
 class BooleanObject(PdfObject):
+    value: bool
+
     def __init__(self, value: Any) -> None:
         self.value = value
 
@@ -370,7 +376,7 @@ class IndirectObject(PdfObject):
             dup = pdf_dest._add_object(
                 obj.clone(pdf_dest, force_duplicate, ignore_fields)
             )
-        assert dup is not None, "mypy"
+        assert isinstance(dup, PdfObject), "mypy"
         assert dup.indirect_reference is not None, "mypy"
         return dup.indirect_reference
 
@@ -379,7 +385,8 @@ class IndirectObject(PdfObject):
         return self
 
     def get_object(self) -> Optional["PdfObject"]:
-        return self.pdf.get_object(self)
+        obj: Optional[PdfObject] = self.pdf.get_object(self)
+        return obj
 
     def __deepcopy__(self, memo: Any) -> "IndirectObject":
         return IndirectObject(self.idnum, self.generation, self.pdf)
@@ -490,7 +497,10 @@ class FloatObject(float, PdfObject):
             # If this isn't a valid decimal (happens in malformed PDFs)
             # fallback to 0
             logger_warning(
-                f"{e} : FloatObject ({value}) invalid; use 0.0 instead", __name__
+                "%(error)s : FloatObject (%(value)s) invalid; use 0.0 instead",
+                source=__name__,
+                error=e,
+                value=value,
             )
             return float.__new__(cls, 0.0)
 
@@ -517,7 +527,7 @@ class FloatObject(float, PdfObject):
         return hash((self.__class__, self.as_numeric))
 
     def myrepr(self) -> str:
-        if self == 0:
+        if self == 0:  # type: ignore[comparison-overlap]
             return "0.0"
         nb = FLOAT_WRITE_PRECISION - int(log10(abs(self)))
         return f"{self:.{max(1, nb)}f}".rstrip("0").rstrip(".")
@@ -545,7 +555,7 @@ class NumberObject(int, PdfObject):
         try:
             return int.__new__(cls, int(value))
         except ValueError:
-            logger_warning(f"NumberObject({value}) invalid; use 0 instead", __name__)
+            logger_warning("NumberObject(%(value)s) invalid; use 0 instead", source=__name__, value=value)
             return int.__new__(cls, 0)
 
     def clone(
@@ -682,8 +692,10 @@ class TextStringObject(str, PdfObject):  # noqa: SLOT000
                 text_string_object = str.__new__(cls, original_bytes.decode("utf-16"))
             except UnicodeDecodeError as exception:
                 logger_warning(
-                    f"{exception!s}\ninitial string:{exception.object!r}",
-                    __name__,
+                    "%(exception)s; initial string: %(initial_string)r",
+                    source=__name__,
+                    exception=exception,
+                    initial_string=exception.object,
                 )
                 text_string_object = str.__new__(cls, exception.object[: exception.start].decode("utf-16"))
             text_string_object._original_bytes = original_bytes
@@ -910,9 +922,9 @@ class NameObject(str, PdfObject):  # noqa: SLOT000
         except (UnicodeEncodeError, UnicodeDecodeError) as e:
             if not pdf.strict:
                 logger_warning(
-                    f"Illegal character in NameObject ({name!r}), "
-                    "you may need to adjust NameObject.CHARSETS",
-                    __name__,
+                    "Illegal character in NameObject (%(name)r), you may need to adjust NameObject.CHARSETS",
+                    source=__name__,
+                    name=name,
                 )
                 return NameObject(name.decode("charmap"))
             raise PdfReadError(

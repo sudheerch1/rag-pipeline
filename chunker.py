@@ -48,28 +48,18 @@ SEPARATORS = ["\n\n", "\n", ". ", "! ", "? ", "; ", ", ", " ", ""]
 
 # ── Bedrock client for semantic chunking ──────────────────────────────────────
 
-def get_bedrock_client():
-    return boto3.client(
-        'bedrock-runtime',
-        region_name=os.environ.get('AWS_REGION', 'us-east-1')
-    )
+from llm_clients import get_embeddings
 
-
-def get_embedding_bedrock(text: str, bedrock_client) -> List[float]:
+def get_embedding_bedrock(text: str, bedrock_client=None) -> List[float]:
     """
-    Get embedding from Amazon Bedrock Titan Embeddings.
-    Uses same model as ingestion pipeline for consistency.
+    Get embedding via LangChain BedrockEmbeddings (Titan).
+    bedrock_client param kept for backward compatibility but unused.
     Truncates to 512 chars for speed during chunking.
     """
-    response = bedrock_client.invoke_model(
-        modelId='amazon.titan-embed-text-v1',
-        body=json.dumps({'inputText': text[:512]})
-    )
-    result = json.loads(response['body'].read())
-    return result['embedding']
+    return get_embeddings().embed_query(text[:512])
 
 
-def get_embedding_with_retry(text: str, bedrock_client, max_retries: int = 3) -> List[float]:
+def get_embedding_with_retry(text: str, bedrock_client=None, max_retries: int = 3) -> List[float]:
     """
     Retry wrapper for Bedrock embeddings with exponential backoff.
     Retries up to max_retries times before raising.
@@ -277,13 +267,11 @@ def chunk_semantic(
     print(f"[semantic chunker] Embedding {len(blocks)} blocks via Bedrock...")
 
     try:
-        bedrock = get_bedrock_client()
-
         # Embed all blocks using Bedrock Titan
         embeddings = []
         for i, block in enumerate(blocks):
             try:
-                emb = get_embedding_with_retry(block.text, bedrock)
+                emb = get_embedding_with_retry(block.text)
                 embeddings.append(emb)
             except Exception as e:
                 print(f"[semantic chunker] Block {i} failed after all retries: {e}")
