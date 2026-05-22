@@ -22,12 +22,19 @@ def parse_pdf(file_bytes: bytes) -> List[ParsedBlock]:
     reader = pypdf.PdfReader(io.BytesIO(file_bytes))
     current_section = ""
 
-    # Patterns to skip — journal headers, page numbers, case citations
+    # Generic PDF noise — applies to any document, not file-specific
     SKIP_PATTERNS = re.compile(
-        r'^(Page \d|CONNECTICUT LAW|June \d|January \d|February \d|'
-        r'March \d|April \d|May \d|July \d|August \d|September \d|'
-        r'October \d|November \d|December \d|\d+ Conn\.|'
-        r'Johnson\s*v\.\s*Superior)',
+        r'^('
+        r'Page \d+'                 # "Page 1", "Page 23"
+        r'|\d+\s*$'                 # lone page numbers: "1", "23"
+        r'|Copyright\s'             # copyright footers
+        r'|All rights reserved'     # footer boilerplate
+        r'|Confidential'            # watermark text
+        r'|CONFIDENTIAL'
+        r'|www\.'                   # URLs in headers/footers
+        r'|http[s]?://'
+        r'|\S+@\S+\.\S+'           # email addresses in footers
+        r')',
         re.IGNORECASE
     )
 
@@ -39,59 +46,59 @@ def parse_pdf(file_bytes: bytes) -> List[ParsedBlock]:
         lines = [l.strip() for l in text.split('\n') if l.strip()]
         current_para_lines = []
 
-        def flush_paragraph():
-            nonlocal current_para_lines
+        def flush_paragraph(page_num, section):
             if not current_para_lines:
                 return
             para_text = ' '.join(current_para_lines)
             if len(para_text.split()) >= 10:
                 blocks.append(ParsedBlock(
-                    text       = para_text,
-                    block_type = BlockType.TEXT,
-                    page       = i + 1,
-                    section    = current_section,
+                    text=para_text,
+                    block_type=BlockType.TEXT,
+                    page=page_num,
+                    section=section,
                 ))
-            current_para_lines = []
+            current_para_lines.clear()
 
         for line in lines:
             words = line.split()
             word_count = len(words)
 
-            # Skip journal headers and page numbers
+            # Skip generic header/footer noise
             if SKIP_PATTERNS.match(line):
-                flush_paragraph()
+                flush_paragraph(i + 1, current_section)
                 continue
 
-            # Short line — potential heading or noise
-            if word_count <= 5:
-                # Check if it looks like a heading
+            # Heading detection — short, title/uppercase, no digits, no punctuation
+            if word_count <= 6:
                 is_titlecase = line.istitle()
                 is_uppercase = line.isupper()
                 has_no_digits = not any(c.isdigit() for c in line)
+                has_no_punctuation = not any(c in line for c in '.,;:()')
 
-                if (is_titlecase or is_uppercase) and has_no_digits:
-                    flush_paragraph()
+                if (is_titlecase or is_uppercase) and has_no_digits and has_no_punctuation:
+                    flush_paragraph(i + 1, current_section)
                     current_section = line
                     blocks.append(ParsedBlock(
-                        text       = line,
-                        block_type = BlockType.HEADING,
-                        page       = i + 1,
-                        section    = current_section,
+                        text=line,
+                        block_type=BlockType.HEADING,
+                        page=i + 1,
+                        section=current_section,
                     ))
                 else:
-                    # Short line but not a heading — skip noise
-                    # e.g. "(SC 21074)", "NUMBER NINETEEN"
-                    flush_paragraph()
+                    # Short line that isn't a heading — treat as paragraph boundary
+                    flush_paragraph(i + 1, current_section)
                 continue
 
-            # Long line — paragraph content
+            # Paragraph content — flush when sentence ends
+            ends_sentence = line[-1] in '.!?'
             current_para_lines.append(line)
+            if ends_sentence:
+                flush_paragraph(i + 1, current_section)
 
-        # Flush remaining paragraph at end of page
-        flush_paragraph()
+        # Flush any remaining lines at end of page
+        flush_paragraph(i + 1, current_section)
 
     return blocks
-
 # ── DOCX ─────────────────────────────────────────────────────────────────────
 
 def parse_docx(file_bytes: bytes) -> List[ParsedBlock]:
