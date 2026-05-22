@@ -18,7 +18,8 @@ from opensearch_client import get_opensearch_client
 from llm_clients import get_embeddings, get_llm
 from langchain_core.prompts import PromptTemplate
 from langchain_core.output_parsers import StrOutputParser
-from config import get_opensearch_endpoint
+from config import get_opensearch_endpoint, get_logger
+logger = get_logger("ingestion")
 
 s3_client = boto3.client('s3')
 bedrock_client = boto3.client('bedrock-runtime',
@@ -54,14 +55,14 @@ class IngestionState(TypedDict):
 # ── Node 1: Download ──────────────────────────────────────────────────────────
 
 def node_download(state: IngestionState) -> IngestionState:
-    print(f"[1/7] Downloading {state['object_key']} from {state['bucket_name']}...")
+    logger.info("node_download started", extra={"node": "node_download", "object_key": state['object_key'], "bucket": state['bucket_name']})
     with tempfile.NamedTemporaryFile(delete=False) as tmp:
         tmp_path = tmp.name
         s3_client.download_file(state['bucket_name'], state['object_key'], tmp_path)
     with open(tmp_path, 'rb') as f:
         file_bytes = f.read()
     os.unlink(tmp_path)
-    print(f"[1/7] Downloaded ({len(file_bytes):,} bytes)")
+    logger.info("node_download complete", extra={"node": "node_download", "bytes": len(file_bytes)})
     return {**state, "file_bytes": file_bytes}
 
 
@@ -69,7 +70,7 @@ def node_download(state: IngestionState) -> IngestionState:
 
 def node_check_duplicate(state: IngestionState) -> IngestionState:
     content_hash = hashlib.sha256(state['file_bytes']).hexdigest()
-    print(f"[2/7] SHA-256: {content_hash[:20]}...")
+    logger.info("node_check_duplicate", extra={"node": "node_check_duplicate", "hash_prefix": content_hash[:20]})
 
     table = dynamodb.Table(METADATA_TABLE)
     response = table.query(
@@ -80,7 +81,7 @@ def node_check_duplicate(state: IngestionState) -> IngestionState:
 
     if items:
         existing = items[0]
-        print(f"[SKIP] Duplicate detected — already ingested as {existing['document_id']}")
+        logger.warning("duplicate detected", extra={"node": "node_check_duplicate", "existing_document_id": existing['document_id'], "status": "duplicate"})
         return {**state, "content_hash": content_hash, "status": "duplicate"}
 
     return {**state, "content_hash": content_hash}
@@ -91,10 +92,10 @@ def node_check_duplicate(state: IngestionState) -> IngestionState:
 def node_detect(state: IngestionState) -> IngestionState:
     filename = state['object_key'].split('/')[-1]
     result = detect(state['file_bytes'], filename)
-    print(f"[3/7] File type: {result.parser_key} (confidence: {result.confidence})")
+    logger.info("node_detect complete", extra={"node": "node_detect", "file_type": result.parser_key, "confidence": result.confidence})
 
     if result.parser_key == 'unknown':
-        print(f"[SKIP] Unrecognised file type for {state['object_key']}")
+        logger.warning("unknown file type", extra={"node": "node_detect", "object_key": state['object_key'], "status": "rejected"})
         _save_metadata(state['object_key'], 'unknown', 0, 0, 'rejected',
                        state['content_hash'],
                        error=f"unknown_file_type:{result.confidence}")
@@ -107,10 +108,12 @@ def node_detect(state: IngestionState) -> IngestionState:
 
 def node_parse(state: IngestionState) -> IngestionState:
     blocks = parse(state['file_bytes'], state['file_type'])
-    print(f"[4/7] Parsed into {len(blocks)} paragraph-level blocks")
+    logger.info("node_parse complete", extra={"node": "node_parse", "blocks": len(blocks)})
+
 
     if not blocks:
-        print(f"[ERROR] No blocks extracted from {state['object_key']}")
+        logger.error("no blocks extracted", extra={"node": "node_parse", "object_key": state['object_key'], "status": "failed"})
+
         _save_metadata(state['object_key'], state['file_type'], 0, 0, 'failed',
                        state['content_hash'], error='no_blocks_extracted')
         return {**state, "blocks": [], "status": "failed", "skip_reason": "no_blocks_extracted"}
@@ -124,7 +127,7 @@ def node_chunk(state: IngestionState) -> IngestionState:
     chunks = chunk(state['blocks'], state['file_type'])
     for c in chunks:
         c.source_key = state['object_key']
-    print(f"[5/7] Semantic chunking → {len(chunks)} chunks from {len(state['blocks'])} blocks")
+    logger.info("node_chunk complete", extra={"node": "node_chunk", "blocks_in": len(state['blocks']), "chunks_out": len(chunks)})
     return {**state, "chunks": chunks}
 
 
@@ -148,7 +151,7 @@ def _embed_with_retry(text: str, max_retries: int = 3) -> list:
             if attempt == max_retries - 1:
                 raise
             wait = 2 ** attempt
-            print(f"[Bedrock] Attempt {attempt+1} failed, retrying in {wait}s: {e}")
+            logger.warning("bedrock embed retry", extra={"node": "node_embed", "attempt": attempt+1, "wait_seconds": wait, "error": str(e)})
             time.sleep(wait)
 
 def _generate_hyq(chunk_text: str) -> list[str]:
@@ -157,19 +160,19 @@ def _generate_hyq(chunk_text: str) -> list[str]:
         questions = [q.strip() for q in raw.strip().split('\n') if q.strip()]
         return [q for q in questions if q.endswith('?')][:3]
     except Exception as e:
-        print(f"[HyQ] Failed (non-blocking): {e}")
+        logger.warning("hyq failed", extra={"node": "node_embed", "error": str(e)})
         return []
 
 def node_embed(state: IngestionState) -> IngestionState:
     chunks = state['chunks']
-    print(f"[6/7] Generating embeddings + HyQ for {len(chunks)} chunks...")
+    logger.info("node_embed started", extra={"node": "node_embed", "chunks": len(chunks)})
     embeddings = []
     for i, c in enumerate(chunks):
-        print(f"  Chunk {i+1}/{len(chunks)} | tokens: {c.token_count} | page: {c.page}")
+
         embedding  = _embed_with_retry(c.text)
         hyq        = _generate_hyq(c.text)
-        if hyq:
-            print(f"  [HyQ] Chunk {i+1}: {len(hyq)} questions")
+        logger.info("chunk embedded", extra={"node": "node_embed", "chunk": i+1, "tokens": c.token_count, "page": c.page, "hyq_count": len(hyq)})
+
         embeddings.append({
             'chunk_index':   c.chunk_index,
             'text':          c.text,
@@ -181,7 +184,7 @@ def node_embed(state: IngestionState) -> IngestionState:
             'section':       getattr(c, 'section', '') or '',
         })
     total_hyq = sum(1 for e in embeddings if e['hyq_questions']) * 3
-    print(f"[6/7] Done — {len(embeddings)} embeddings | ~{total_hyq} HyQ questions")
+    logger.info("node_embed complete", extra={"node": "node_embed", "embeddings": len(embeddings), "total_hyq": total_hyq})
     return {**state, "embeddings": embeddings}
 
 
@@ -199,11 +202,11 @@ def node_store(state: IngestionState) -> IngestionState:
         )
         deleted = response.get('deleted', 0)
         if deleted:
-            print(f"[OpenSearch] Deleted {deleted} stale chunks for {object_key}")
+            logger.info("stale chunks deleted", extra={"node": "node_store", "deleted": deleted, "object_key": object_key})
         else:
-            print(f"[OpenSearch] No stale chunks (first ingestion)")
+            logger.info("no stale chunks", extra={"node": "node_store", "object_key": object_key})
     except Exception as e:
-        print(f"[OpenSearch] Warning: could not delete old chunks: {e}")
+        logger.warning("delete stale chunks failed", extra={"node": "node_store", "error": str(e)})
 
     # Index new chunks
     for item in state['embeddings']:
@@ -216,7 +219,8 @@ def node_store(state: IngestionState) -> IngestionState:
             'hyq_questions': item['hyq_questions'],
             'section':       item['section'],
         })
-    print(f"[7/7] Stored {len(state['embeddings'])} chunks in OpenSearch")
+    logger.info("node_store complete", extra={"node": "node_store", "chunks_stored": len(state['embeddings']), "object_key": object_key})
+
 
     # Save metadata
     _save_metadata(object_key, state['file_type'],
@@ -232,18 +236,18 @@ def node_store(state: IngestionState) -> IngestionState:
         Body=json.dumps(chunks_data, indent=2),
         ContentType='application/json'
     )
-    print(f"[S3] Backed up to s3://{PROCESSED_BUCKET}/{output_key}")
 
     # Summary
-    print("-" * 60)
-    print(f"PIPELINE SUMMARY")
-    print(f"  File   : {object_key}")
-    print(f"  Type   : {state['file_type']}")
-    print(f"  Blocks : {len(state['blocks'])}")
-    print(f"  Chunks : {len(state['chunks'])}")
-    print(f"  Hash   : {state['content_hash'][:20]}...")
-    print(f"  Status : completed ✅")
-    print("-" * 60)
+    logger.info("pipeline complete", extra={
+    "node":        "node_store",
+    "object_key":  object_key,
+    "file_type":   state['file_type'],
+    "blocks":      len(state['blocks']),
+    "chunks":      len(state['chunks']),
+    "hash_prefix": state['content_hash'][:20],
+    "s3_backup":   f"s3://{PROCESSED_BUCKET}/{output_key}",
+    "status":      "completed"
+})
 
     return {**state, "status": "completed"}
 
@@ -307,16 +311,14 @@ def _save_metadata(object_key, file_type, blocks, chunks, status, content_hash, 
         'content_hash':  content_hash,
         'error':         error or 'none'
     })
-    print(f"[DynamoDB] Saved | {object_key} | {status}")
+    logger.info("dynamodb saved", extra={"node": "node_store", "object_key": object_key, "status": status})
 
 
 # ── Lambda Handler ────────────────────────────────────────────────────────────
 
 def lambda_handler(event, context):
-    print("=" * 60)
-    print("RAG Ingestion Pipeline — triggered")
-    print(f"Records in batch: {len(event['Records'])}")
-    print("=" * 60)
+
+    logger.info("lambda triggered", extra={"records": len(event['Records'])})
 
     processed, failed, skipped = [], [], []
 
@@ -325,7 +327,7 @@ def lambda_handler(event, context):
             body = json.loads(record['body'])
 
             if 'Event' in body and body['Event'] == 's3:TestEvent':
-                print("[SQS] Skipping S3 test event")
+                logger.info("skipping s3 test event")
                 continue
 
             s3_event    = body['Records'][0]
@@ -333,7 +335,7 @@ def lambda_handler(event, context):
             object_key  = unquote_plus(s3_event['s3']['object']['key'])
             file_size   = s3_event['s3']['object'].get('size', 0)
 
-            print(f"[SQS] Bucket: {bucket_name} | File: {object_key} | Size: {file_size:,} bytes")
+            logger.info("processing record", extra={"bucket": bucket_name, "object_key": object_key, "file_size": file_size})
 
             final_state = ingestion_graph.invoke({
                 "bucket_name":  bucket_name,
@@ -356,13 +358,11 @@ def lambda_handler(event, context):
                 processed.append(object_key)
 
         except Exception as e:
-            print(f"[ERROR] {str(e)}")
+            logger.error("pipeline failed", extra={"object_key": object_key, "error": str(e)})
             failed.append(str(e))
             raise
 
-    print("=" * 60)
-    print(f"BATCH COMPLETE | processed: {len(processed)} | skipped: {len(skipped)} | failed: {len(failed)}")
-    print("=" * 60)
+    logger.info("batch complete", extra={"processed": len(processed), "skipped": len(skipped), "failed": len(failed)})
 
     return {
         'statusCode': 200,

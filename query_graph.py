@@ -8,6 +8,8 @@ from langchain_core.runnables import RunnableLambda, RunnablePassthrough
 
 from llm_clients import get_embeddings, get_llm
 from opensearch_client import get_opensearch_client
+from config import get_logger
+logger = get_logger("query")
 
 # ── CORS Headers ──────────────────────────────────────────────────────────────
 CORS_HEADERS = {
@@ -36,10 +38,10 @@ hyde_chain = hyde_prompt | get_llm() | StrOutputParser()
 def run_hyde(state: dict) -> dict:
     try:
         hyde_text = hyde_chain.invoke({"question": state["question"]})
-        print(f"HyDE generated: {hyde_text[:100]}...")
+        logger.info("hyde complete", extra={"step": "run_hyde", "hyde_preview": hyde_text[:100]})
         state["hyde_text"] = hyde_text
     except Exception as e:
-        print(f"HyDE failed (non-blocking): {e}")
+        logger.warning("hyde failed", extra={"step": "run_hyde", "error": str(e)})
         state["hyde_text"] = state["question"]
     return state
 
@@ -84,8 +86,7 @@ def run_search(state: dict) -> dict:
     )
 
     hits = response['hits']['hits']
-    print(f"Hybrid search found {len(hits)} candidates")
-
+    logger.info("hybrid search complete", extra={"step": "run_search", "candidates": len(hits)})
     state["chunks"] = [
         {
             'text': h['_source']['text'],
@@ -127,10 +128,10 @@ def run_rerank(state: dict) -> dict:
             c['original_score'] = c['score']
             c['score'] = item['relevance_score']
             reranked.append(c)
-        print(f"Reranked {len(chunks)} → top {len(reranked)}")
+        logger.info("rerank complete", extra={"step": "run_rerank", "chunks_in": len(chunks), "chunks_out": len(reranked)})
         state["chunks"] = reranked
     except Exception as e:
-        print(f"Reranking failed (non-blocking): {e}")
+        logger.warning("rerank failed", extra={"step": "run_rerank", "error": str(e)})
         state["chunks"] = chunks[:top_n]
 
     return state
@@ -145,7 +146,7 @@ def run_dedup(state: dict) -> dict:
         if key not in seen:
             seen.add(key)
             unique.append(c)
-    print(f"After deduplication: {len(unique)} unique chunks")
+    logger.info("dedup complete", extra={"step": "run_dedup", "unique_chunks": len(unique)})
     state["chunks"] = unique
     return state
 
@@ -173,7 +174,7 @@ def run_answer(state: dict) -> dict:
         "context": context,
         "question": state["question"]
     })
-    print("Answer generated")
+    logger.info("answer generated", extra={"step": "run_answer", "question_preview": state['question'][:80]})
     return state
 
 
@@ -211,7 +212,7 @@ def lambda_handler(event, context):
             'body': json.dumps({'error': 'No question provided'})
         }
 
-    print(f"Question: {question}")
+    logger.info("query received", extra={"question_preview": question[:80]})
 
     state = query_pipeline.invoke({"question": question})
 
