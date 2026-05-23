@@ -9,6 +9,7 @@ from langchain_core.runnables import RunnableLambda, RunnablePassthrough
 from llm_clients import get_embeddings, get_llm
 from opensearch_client import get_opensearch_client
 from config import get_logger
+from datetime import datetime, timezone
 logger = get_logger("query")
 
 # ── CORS Headers ──────────────────────────────────────────────────────────────
@@ -189,10 +190,47 @@ query_pipeline = (
 )
 
 
+def health_check() -> dict:
+    checks = {}
+    overall = "healthy"
+
+    # Check OpenSearch
+    try:
+        client = get_opensearch_client()
+        client.cluster.health()
+        checks["opensearch"] = "connected"
+    except Exception as e:
+        checks["opensearch"] = "unreachable"
+        overall = "degraded"
+        logger.warning("health check opensearch failed", extra={"error": str(e)})
+
+    return {
+        "status": overall,
+        "checks": checks,
+        "timestamp": datetime.now(timezone.utc).isoformat()
+    }
+
+
 # ── Lambda handler ────────────────────────────────────────────────────────────
 
 def lambda_handler(event, context):
 
+    logger.info("incoming event", extra={
+        "httpMethod": event.get('httpMethod'),
+        "path": event.get('path'),
+        "resource": event.get('resource')
+    })
+        
+    # Health check — no auth required
+    if event.get('httpMethod') == 'GET' and event.get('path') == '/health':
+        result = health_check()
+        status_code = 200 if result["status"] == "healthy" else 503
+        return {
+            'statusCode': status_code,
+            'headers': CORS_HEADERS,
+            'body': json.dumps(result)
+        }
+        
     if event.get('httpMethod') == 'OPTIONS':
         return {'statusCode': 200, 'headers': CORS_HEADERS, 'body': ''}
 
@@ -233,3 +271,4 @@ def lambda_handler(event, context):
             ]
         })
     }
+    
