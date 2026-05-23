@@ -221,6 +221,7 @@ def lambda_handler(event, context):
         "resource": event.get('resource')
     })
         
+        
     # Health check — no auth required
     if event.get('httpMethod') == 'GET' and event.get('path') == '/health':
         result = health_check()
@@ -243,13 +244,40 @@ def lambda_handler(event, context):
 
     question = body.get('question', '')
 
-    if not question:
+    # ── Input Validation ──────────────────────────────────────────────────────────
+    if not question or not isinstance(question, str):
+        logger.warning("validation failed", extra={"reason": "missing or non-string question"})
         return {
             'statusCode': 400,
             'headers': CORS_HEADERS,
-            'body': json.dumps({'error': 'No question provided'})
+            'body': json.dumps({'error': 'question is required and must be a string'})
         }
 
+    question = question.strip()
+
+    if len(question) == 0:
+        logger.warning("validation failed", extra={"reason": "blank question after strip"})
+        return {
+            'statusCode': 400,
+            'headers': CORS_HEADERS,
+            'body': json.dumps({'error': 'question cannot be blank'})
+        }
+
+    if len(question) < 3:
+        logger.warning("validation failed", extra={"reason": "question too short", "length": len(question)})
+        return {
+            'statusCode': 400,
+            'headers': CORS_HEADERS,
+            'body': json.dumps({'error': 'question too short (minimum 3 characters)'})
+        }
+
+    if len(question) > 1000:
+        logger.warning("validation failed", extra={"reason": "question too long", "length": len(question)})
+        return {
+            'statusCode': 400,
+            'headers': CORS_HEADERS,
+            'body': json.dumps({'error': 'question too long (maximum 1000 characters)'})
+        }
     logger.info("query received", extra={"question_preview": question[:80]})
 
     state = query_pipeline.invoke({"question": question})
@@ -271,4 +299,4 @@ def lambda_handler(event, context):
             ]
         })
     }
-    
+
