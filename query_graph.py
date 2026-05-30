@@ -166,11 +166,40 @@ Answer:""")
 
 answer_chain = answer_prompt | get_llm() | StrOutputParser()
 
+# Token budget constant — cap context passed to Nova
+CONTEXT_TOKEN_BUDGET = 2000
+CHARS_PER_TOKEN = 4  # rough approximation: 1 token ≈ 4 characters
+
 def run_answer(state: dict) -> dict:
-    context = "\n\n".join([
-        f"Source: {c['source']} (Page {c['page']})\n{c['text']}"
-        for c in state["chunks"]
-    ])
+    # ── Token budget enforcement ──────────────────────────────────────────────
+    # Build context chunks one by one, stopping when budget is exceeded.
+    # Prevents runaway prompt sizes and controls Nova costs.
+    budget_chars = CONTEXT_TOKEN_BUDGET * CHARS_PER_TOKEN
+    context_parts = []
+    used_chars = 0
+
+    for c in state["chunks"]:
+        part = f"Source: {c['source']} (Page {c['page']})\n{c['text']}"
+        if used_chars + len(part) > budget_chars:
+            logger.warning("token budget reached", extra={
+                "step": "run_answer",
+                "chunks_used": len(context_parts),
+                "chunks_total": len(state["chunks"]),
+                "budget_chars": budget_chars,
+                "used_chars": used_chars
+            })
+            break
+        context_parts.append(part)
+        used_chars += len(part)
+
+    context = "\n\n".join(context_parts)
+    logger.info("context built", extra={
+        "step": "run_answer",
+        "chunks_used": len(context_parts),
+        "chunks_total": len(state["chunks"]),
+        "estimated_tokens": used_chars // CHARS_PER_TOKEN
+    })
+
     state["answer"] = answer_chain.invoke({
         "context": context,
         "question": state["question"]
@@ -288,6 +317,7 @@ def lambda_handler(event, context):
         'body': json.dumps({
             'question': state["question"],
             'answer': state["answer"],
+            'context': [c['text'] for c in state["chunks"]],
             'sources': [
                 {
                     'source': c['source'],
