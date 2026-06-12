@@ -8,3 +8,5 @@ lambda_package.zip
 .vscode/
 Add-Content .gitignore ".env"
 Add-Content .gitignore "*.env"
+output.json
+payload.json
