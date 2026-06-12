@@ -15,7 +15,7 @@ from detector import detect
 from parsers import parse
 from chunker import chunk
 from opensearch_client import get_opensearch_client
-from llm_clients import get_embeddings, get_llm
+from llm_clients import embed_query, get_llm
 from langchain_core.prompts import PromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from config import get_opensearch_endpoint, get_logger
@@ -146,7 +146,7 @@ hyq_chain = hyq_prompt | get_llm() | StrOutputParser()
 def _embed_with_retry(text: str, max_retries: int = 3) -> list:
     for attempt in range(max_retries):
         try:
-            return get_embeddings().embed_query(text)
+            return embed_query(text)
         except Exception as e:
             if attempt == max_retries - 1:
                 raise
