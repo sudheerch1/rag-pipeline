@@ -48,15 +48,15 @@ SEPARATORS = ["\n\n", "\n", ". ", "! ", "? ", "; ", ", ", " ", ""]
 
 # ── Bedrock client for semantic chunking ──────────────────────────────────────
 
-from llm_clients import get_embeddings
+from llm_clients import embed_query
 
 def get_embedding_bedrock(text: str, bedrock_client=None) -> List[float]:
     """
-    Get embedding via LangChain BedrockEmbeddings (Titan).
+    Get embedding via Cohere Embed v4 (search_query input_type).
     bedrock_client param kept for backward compatibility but unused.
     Truncates to 512 chars for speed during chunking.
     """
-    return get_embeddings().embed_query(text[:512])
+    return embed_query(text[:512])
 
 
 def get_embedding_with_retry(text: str, bedrock_client=None, max_retries: int = 3) -> List[float]:

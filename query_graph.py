@@ -6,7 +6,7 @@ from langchain_core.prompts import PromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.runnables import RunnableLambda, RunnablePassthrough
 
-from llm_clients import get_embeddings, get_llm
+from llm_clients import embed_query, get_llm
 from opensearch_client import get_opensearch_client
 from config import get_logger
 from datetime import datetime, timezone
@@ -50,7 +50,7 @@ def run_hyde(state: dict) -> dict:
 # ── Step 2: Embed + Hybrid Search ─────────────────────────────────────────────
 
 def run_search(state: dict) -> dict:
-    question_vector = get_embeddings().embed_query(state["hyde_text"])
+    question_vector = embed_query(state["hyde_text"])
     question = state["question"]
     top_k = 10
 
