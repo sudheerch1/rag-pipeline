@@ -52,7 +52,7 @@ def run_hyde(state: dict) -> dict:
 def run_search(state: dict) -> dict:
     question_vector = embed_query(state["hyde_text"])
     question = state["question"]
-    top_k = 10
+    top_k = 15  # A1: increased from 10 — larger candidate pool for reranker
 
     query = {
         "size": top_k,
@@ -106,7 +106,7 @@ def run_search(state: dict) -> dict:
 def run_rerank(state: dict) -> dict:
     chunks = state["chunks"]
     question = state["question"]
-    top_n = 5
+    top_n = 5  # A2: increased from 5 — pass more chunks to answer generation
 
     if not chunks:
         return state
@@ -166,14 +166,14 @@ Answer:""")
 
 answer_chain = answer_prompt | get_llm() | StrOutputParser()
 
-# Token budget constant — cap context passed to Nova
-CONTEXT_TOKEN_BUDGET = 2000
+# Token budget constant — cap context passed to LLM
+CONTEXT_TOKEN_BUDGET = 3000  # A3: increased from 2000 — Haiku 4.5 handles larger context
 CHARS_PER_TOKEN = 4  # rough approximation: 1 token ≈ 4 characters
 
 def run_answer(state: dict) -> dict:
     # ── Token budget enforcement ──────────────────────────────────────────────
     # Build context chunks one by one, stopping when budget is exceeded.
-    # Prevents runaway prompt sizes and controls Nova costs.
+    # Prevents runaway prompt sizes and controls costs.
     budget_chars = CONTEXT_TOKEN_BUDGET * CHARS_PER_TOKEN
     context_parts = []
     used_chars = 0
@@ -329,4 +329,3 @@ def lambda_handler(event, context):
             ]
         })
     }
-
