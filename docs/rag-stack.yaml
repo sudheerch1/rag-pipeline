@@ -1,0 +1,800 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Production-Grade RAG Pipeline on AWS - Complete Infrastructure Stack
+  Covers: S3, SQS, DynamoDB, Lambda, API Gateway, Cognito, CloudFront, 
+  CloudWatch, SNS, Parameter Store, IAM
+  
+  NOT covered by this template (requires post-deploy scripts):
+    - OpenSearch domain internal config (create_index.py, setup_hybrid_search.py)
+    - OpenSearch IAM backend role mapping (done in Dashboards UI)
+    - Lambda deployment packages (deploy separately via S3)
+  
+  Author: Sudheer Cherukuri
+  Version: 1.0 | June 2026
+
+Parameters:
+  Environment:
+    Type: String
+    Default: prod
+    AllowedValues: [prod, dev, staging]
+    Description: Deployment environment
+
+  LangSmithApiKey:
+    Type: String
+    NoEcho: true
+    Description: LangSmith API key for tracing (stored in Parameter Store as SecureString)
+
+  OpenSearchMasterPassword:
+    Type: String
+    NoEcho: true
+    MinLength: 8
+    Description: OpenSearch master user password
+
+  NotificationEmail:
+    Type: String
+    Description: Email address for DLQ alarm notifications
+    Default: sudheer@example.com
+
+  OpenSearchInstanceType:
+    Type: String
+    Default: t3.small.search
+    AllowedValues: [t3.small.search, t3.medium.search, m6g.large.search]
+    Description: OpenSearch instance type (t3.small = ~$50-100/month)
+
+# ─────────────────────────────────────────────
+# RESOURCES
+# ─────────────────────────────────────────────
+Resources:
+
+  # ═══════════════════════════════════════════
+  # IAM
+  # ═══════════════════════════════════════════
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub rag-lambda-role-${Environment}
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess
+      Policies:
+        - PolicyName: RagPipelinePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: S3Access
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt RawBucket.Arn
+                  - !Sub ${RawBucket.Arn}/*
+                  - !GetAtt ProcessedBucket.Arn
+                  - !Sub ${ProcessedBucket.Arn}/*
+
+              - Sid: SQSAccess
+                Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                  - sqs:SendMessage
+                Resource:
+                  - !GetAtt IngestionQueue.Arn
+                  - !GetAtt IngestionDLQ.Arn
+
+              - Sid: DynamoDBAccess
+                Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource:
+                  - !GetAtt MetadataTable.Arn
+                  - !Sub ${MetadataTable.Arn}/index/*
+
+              - Sid: BedrockAccess
+                Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                  - bedrock:InvokeModelWithResponseStream
+                Resource: "*"
+
+              - Sid: OpenSearchAccess
+                Effect: Allow
+                Action:
+                  - es:ESHttpGet
+                  - es:ESHttpPost
+                  - es:ESHttpPut
+                  - es:ESHttpDelete
+                Resource: !Sub arn:aws:es:${AWS::Region}:${AWS::AccountId}:domain/rag-vectors/*
+
+              - Sid: ParameterStoreAccess
+                Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                  - ssm:GetParameters
+                Resource:
+                  - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/rag/*
+
+              - Sid: SecretsManagerAccess
+                Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource:
+                  - !Ref OpenSearchSecret
+
+              - Sid: CloudWatchLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+
+  # ═══════════════════════════════════════════
+  # S3 BUCKETS
+  # ═══════════════════════════════════════════
+  RawBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub rag-raw-${AWS::AccountId}
+      NotificationConfiguration:
+        QueueConfigurations:
+          - Event: s3:ObjectCreated:*
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: suffix
+                    Value: .pdf
+            Queue: !GetAtt IngestionQueue.Arn
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+  ProcessedBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub rag-processed-${AWS::AccountId}
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+  FrontendBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub rag-frontend-${AWS::AccountId}
+      WebsiteConfiguration:
+        IndexDocument: index.html
+        ErrorDocument: index.html
+
+  FrontendBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref FrontendBucket
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub ${FrontendBucket.Arn}/*
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub arn:aws:cloudfront::${AWS::AccountId}:distribution/${CloudFrontDistribution}
+
+  # ═══════════════════════════════════════════
+  # SQS
+  # ═══════════════════════════════════════════
+  IngestionDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: rag-ingestion-dlq
+      MessageRetentionPeriod: 1209600  # 14 days
+      KmsMasterKeyId: alias/aws/sqs
+
+  IngestionQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: rag-ingestion-queue
+      VisibilityTimeout: 300          # Must match Lambda timeout
+      MessageRetentionPeriod: 86400   # 1 day
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt IngestionDLQ.Arn
+        maxReceiveCount: 3
+      KmsMasterKeyId: alias/aws/sqs
+
+  # Allow S3 to send messages to SQS
+  IngestionQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref IngestionQueue
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: s3.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt IngestionQueue.Arn
+            Condition:
+              ArnLike:
+                aws:SourceArn: !GetAtt RawBucket.Arn
+
+  # ═══════════════════════════════════════════
+  # DYNAMODB
+  # ═══════════════════════════════════════════
+  MetadataTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: rag-metadata
+      BillingMode: PAY_PER_REQUEST
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      AttributeDefinitions:
+        - AttributeName: document_id
+          AttributeType: S
+        - AttributeName: content_hash
+          AttributeType: S
+      KeySchema:
+        - AttributeName: document_id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: content-hash-index
+          KeySchema:
+            - AttributeName: content_hash
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+      SSESpecification:
+        SSEEnabled: true
+
+  # ═══════════════════════════════════════════
+  # SECRETS MANAGER
+  # ═══════════════════════════════════════════
+  OpenSearchSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: rag/opensearch/credentials
+      Description: OpenSearch master user credentials
+      SecretString: !Sub |
+        {
+          "username": "admin",
+          "password": "${OpenSearchMasterPassword}"
+        }
+
+  # ═══════════════════════════════════════════
+  # PARAMETER STORE
+  # ═══════════════════════════════════════════
+  LangSmithApiKeyParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /rag/langsmith/api-key
+      Type: String          # Use SecureString via CLI after deploy (CFN limitation)
+      Value: !Ref LangSmithApiKey
+      Description: LangSmith API key for pipeline tracing
+
+  # OpenSearch endpoint parameter — updated post-deploy when cluster is created
+  OpenSearchEndpointParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /rag/opensearch/endpoint
+      Type: String
+      Value: PLACEHOLDER_UPDATE_AFTER_OPENSEARCH_CREATION
+      Description: OpenSearch domain endpoint — update after cluster creation
+
+  # ═══════════════════════════════════════════
+  # OPENSEARCH DOMAIN
+  # ═══════════════════════════════════════════
+  # NOTE: OpenSearch takes 15-20 min to create.
+  # After stack creation, you MUST run:
+  #   1. python create_index.py
+  #   2. python setup_hybrid_search.py
+  #   3. Map IAM backend role in OpenSearch Dashboards UI
+  OpenSearchDomain:
+    Type: AWS::OpenSearchService::Domain
+    Properties:
+      DomainName: rag-vectors
+      EngineVersion: OpenSearch_2.11
+      ClusterConfig:
+        InstanceType: !Ref OpenSearchInstanceType
+        InstanceCount: 1
+        DedicatedMasterEnabled: false
+        ZoneAwarenessEnabled: false
+      EBSOptions:
+        EBSEnabled: true
+        VolumeType: gp3
+        VolumeSize: 20
+      EncryptionAtRestOptions:
+        Enabled: true
+      NodeToNodeEncryptionOptions:
+        Enabled: true
+      DomainEndpointOptions:
+        EnforceHTTPS: true
+        TLSSecurityPolicy: Policy-Min-TLS-1-2-2019-07
+      AdvancedSecurityOptions:
+        Enabled: true
+        InternalUserDatabaseEnabled: true
+        MasterUserOptions:
+          MasterUserName: admin
+          MasterUserPassword: !Ref OpenSearchMasterPassword
+      AccessPolicies:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !GetAtt LambdaExecutionRole.Arn
+            Action: es:*
+            Resource: !Sub arn:aws:es:${AWS::Region}:${AWS::AccountId}:domain/rag-vectors/*
+
+  # ═══════════════════════════════════════════
+  # LAMBDA FUNCTIONS
+  # ═══════════════════════════════════════════
+
+  # Ingestion Lambda
+  IngestionLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: rag-document-processor
+      Runtime: python3.11
+      Architectures: [arm64]
+      Handler: ingestion_graph.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 300
+      MemorySize: 512
+      Code:
+        S3Bucket: !Ref ProcessedBucket
+        S3Key: deployments/ingestion_package.zip   # Upload package before stack create
+      Layers:
+        - !Sub arn:aws:lambda:${AWS::Region}:901920570463:layer:aws-otel-python-arm64-ver-1-21-0:1
+      Environment:
+        Variables:
+          LANGCHAIN_TRACING_V2: "true"
+          LANGCHAIN_PROJECT: rag-pipeline
+          LANGCHAIN_API_KEY: !Sub "{{resolve:ssm:/rag/langsmith/api-key}}"
+          OTEL_TRACES_EXPORTER: awsxray
+          AWS_LAMBDA_EXEC_WRAPPER: /opt/otel-instrument
+          ENVIRONMENT: !Ref Environment
+      TracingConfig:
+        Mode: Active
+      Tags:
+        - Key: Project
+          Value: rag-pipeline
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Trigger: SQS → Ingestion Lambda
+  IngestionEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt IngestionQueue.Arn
+      FunctionName: !GetAtt IngestionLambda.Arn
+      BatchSize: 1
+      FunctionResponseTypes:
+        - ReportBatchItemFailures
+
+  # Query Lambda
+  QueryLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: rag-query
+      Runtime: python3.11
+      Architectures: [arm64]
+      Handler: query_graph.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      MemorySize: 512
+      Code:
+        S3Bucket: !Ref ProcessedBucket
+        S3Key: deployments/query_package.zip        # Upload package before stack create
+      Layers:
+        - !Sub arn:aws:lambda:${AWS::Region}:901920570463:layer:aws-otel-python-arm64-ver-1-21-0:1
+      Environment:
+        Variables:
+          LANGCHAIN_TRACING_V2: "true"
+          LANGCHAIN_PROJECT: rag-pipeline
+          LANGCHAIN_API_KEY: !Sub "{{resolve:ssm:/rag/langsmith/api-key}}"
+          OTEL_TRACES_EXPORTER: awsxray
+          AWS_LAMBDA_EXEC_WRAPPER: /opt/otel-instrument
+          ENVIRONMENT: !Ref Environment
+      TracingConfig:
+        Mode: Active
+      Tags:
+        - Key: Project
+          Value: rag-pipeline
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ═══════════════════════════════════════════
+  # COGNITO
+  # ═══════════════════════════════════════════
+  CognitoUserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub rag-user-pool-${Environment}
+      AutoVerifiedAttributes:
+        - email
+      UsernameAttributes:
+        - email
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireUppercase: true
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: false
+
+  CognitoUserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: rag-query-app
+      UserPoolId: !Ref CognitoUserPool
+      GenerateSecret: false
+      AllowedOAuthFlows:
+        - implicit                        # POC: implicit grant
+        # Production: replace with 'code' + PKCE
+      AllowedOAuthScopes:
+        - email
+        - openid
+      AllowedOAuthFlowsUserPoolClient: true
+      CallbackURLs:
+        - !Sub https://${CloudFrontDistribution.DomainName}
+      SupportedIdentityProviders:
+        - COGNITO
+
+  CognitoUserPoolDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      Domain: !Sub rag-auth-${AWS::AccountId}
+      UserPoolId: !Ref CognitoUserPool
+
+  # ═══════════════════════════════════════════
+  # API GATEWAY
+  # ═══════════════════════════════════════════
+  RestApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub rag-api-${Environment}
+      Description: RAG Pipeline REST API
+      EndpointConfiguration:
+        Types: [REGIONAL]
+
+  # Cognito Authorizer
+  CognitoAuthorizer:
+    Type: AWS::ApiGateway::Authorizer
+    Properties:
+      Name: CognitoAuthorizer
+      Type: COGNITO_USER_POOLS
+      RestApiId: !Ref RestApi
+      IdentitySource: method.request.header.Authorization
+      ProviderARNs:
+        - !GetAtt CognitoUserPool.Arn
+
+  # /query resource
+  QueryResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestApi
+      ParentId: !GetAtt RestApi.RootResourceId
+      PathPart: query
+
+  # POST /query
+  QueryMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref QueryResource
+      HttpMethod: POST
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref CognitoAuthorizer
+      ApiKeyRequired: true
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${QueryLambda.Arn}/invocations
+
+  # /health resource
+  HealthResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestApi
+      ParentId: !GetAtt RestApi.RootResourceId
+      PathPart: health
+
+  # GET /health (no auth, no API key)
+  HealthMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref HealthResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      ApiKeyRequired: false
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${QueryLambda.Arn}/invocations
+
+  # API Gateway deployment
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn: [QueryMethod, HealthMethod]
+    Properties:
+      RestApiId: !Ref RestApi
+
+  ApiStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      RestApiId: !Ref RestApi
+      DeploymentId: !Ref ApiDeployment
+      StageName: !Ref Environment
+      TracingEnabled: true
+      MethodSettings:
+        - ResourcePath: "/*"
+          HttpMethod: "*"
+          ThrottlingBurstLimit: 20
+          ThrottlingRateLimit: 10
+
+  # API Key
+  ApiKey:
+    Type: AWS::ApiGateway::ApiKey
+    Properties:
+      Name: !Sub rag-api-key-${Environment}
+      Enabled: true
+      StageKeys:
+        - RestApiId: !Ref RestApi
+          StageName: !Ref Environment
+
+  # Usage Plan
+  UsagePlan:
+    Type: AWS::ApiGateway::UsagePlan
+    Properties:
+      UsagePlanName: !Sub rag-usage-plan-${Environment}
+      Throttle:
+        RateLimit: 10
+        BurstLimit: 20
+      Quota:
+        Limit: 1000
+        Period: MONTH
+      ApiStages:
+        - ApiId: !Ref RestApi
+          Stage: !Ref Environment
+
+  UsagePlanKey:
+    Type: AWS::ApiGateway::UsagePlanKey
+    Properties:
+      KeyId: !Ref ApiKey
+      KeyType: API_KEY
+      UsagePlanId: !Ref UsagePlan
+
+  # Lambda permissions for API Gateway
+  QueryLambdaApiPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt QueryLambda.Arn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${RestApi}/*
+
+  # ═══════════════════════════════════════════
+  # CLOUDFRONT
+  # ═══════════════════════════════════════════
+  CloudFrontOAC:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: rag-frontend-oac
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        DefaultRootObject: index.html
+        Origins:
+          - Id: FrontendS3
+            DomainName: !GetAtt FrontendBucket.RegionalDomainName
+            OriginAccessControlId: !GetAtt CloudFrontOAC.Id
+            S3OriginConfig:
+              OriginAccessIdentity: ""
+        DefaultCacheBehavior:
+          TargetOriginId: FrontendS3
+          ViewerProtocolPolicy: redirect-to-https
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6  # CachingOptimized managed policy
+          AllowedMethods: [GET, HEAD]
+          CachedMethods: [GET, HEAD]
+        CustomErrorResponses:
+          - ErrorCode: 404
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+          - ErrorCode: 403
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+
+  # ═══════════════════════════════════════════
+  # CLOUDWATCH & SNS ALARMS
+  # ═══════════════════════════════════════════
+  AlarmTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: rag-alarms
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref NotificationEmail
+
+  DLQDepthAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: rag-dlq-depth-alarm
+      AlarmDescription: Fires when any message lands in the ingestion DLQ
+      MetricName: ApproximateNumberOfMessagesVisible
+      Namespace: AWS/SQS
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt IngestionDLQ.QueueName
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions:
+        - !Ref AlarmTopic
+      TreatMissingData: notBreaching
+
+  QueryErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: rag-query-error-alarm
+      AlarmDescription: Query Lambda error rate elevated
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref QueryLambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions:
+        - !Ref AlarmTopic
+
+  Dashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: rag-pipeline-dashboard
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "properties": {
+                "title": "Lambda Invocations",
+                "metrics": [
+                  ["AWS/Lambda", "Invocations", "FunctionName", "${QueryLambda}"],
+                  ["AWS/Lambda", "Invocations", "FunctionName", "${IngestionLambda}"]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "view": "timeSeries"
+              }
+            },
+            {
+              "type": "metric",
+              "properties": {
+                "title": "Lambda Errors",
+                "metrics": [
+                  ["AWS/Lambda", "Errors", "FunctionName", "${QueryLambda}"],
+                  ["AWS/Lambda", "Errors", "FunctionName", "${IngestionLambda}"]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "view": "timeSeries"
+              }
+            },
+            {
+              "type": "metric",
+              "properties": {
+                "title": "Query Lambda Duration p50/p99",
+                "metrics": [
+                  ["AWS/Lambda", "Duration", "FunctionName", "${QueryLambda}", {"stat": "p50"}],
+                  ["AWS/Lambda", "Duration", "FunctionName", "${QueryLambda}", {"stat": "p99"}]
+                ],
+                "period": 300,
+                "view": "timeSeries"
+              }
+            },
+            {
+              "type": "metric",
+              "properties": {
+                "title": "Lambda Throttles",
+                "metrics": [
+                  ["AWS/Lambda", "Throttles", "FunctionName", "${QueryLambda}"]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "view": "timeSeries"
+              }
+            },
+            {
+              "type": "metric",
+              "properties": {
+                "title": "DLQ Depth",
+                "metrics": [
+                  ["AWS/SQS", "ApproximateNumberOfMessagesVisible", "QueueName", "${IngestionDLQ.QueueName}"]
+                ],
+                "period": 60,
+                "stat": "Maximum",
+                "view": "timeSeries"
+              }
+            }
+          ]
+        }
+
+# ─────────────────────────────────────────────
+# OUTPUTS
+# ─────────────────────────────────────────────
+Outputs:
+  CloudFrontURL:
+    Value: !Sub https://${CloudFrontDistribution.DomainName}
+    Description: Frontend URL
+
+  ApiEndpoint:
+    Value: !Sub https://${RestApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}
+    Description: API Gateway base URL
+
+  CognitoUserPoolId:
+    Value: !Ref CognitoUserPool
+    Description: Cognito User Pool ID
+
+  CognitoAppClientId:
+    Value: !Ref CognitoUserPoolClient
+    Description: Cognito App Client ID
+
+  CognitoHostedUI:
+    Value: !Sub https://rag-auth-${AWS::AccountId}.auth.${AWS::Region}.amazoncognito.com/login?client_id=${CognitoUserPoolClient}&response_type=token&scope=email+openid&redirect_uri=https://${CloudFrontDistribution.DomainName}
+    Description: Cognito Hosted UI login URL (implicit grant)
+
+  OpenSearchDomainEndpoint:
+    Value: !GetAtt OpenSearchDomain.DomainEndpoint
+    Description: |
+      OpenSearch endpoint — copy this value and run:
+        aws ssm put-parameter --name /rag/opensearch/endpoint --value <THIS_VALUE> --type String --overwrite --profile rag-dev
+      Then run: python create_index.py && python setup_hybrid_search.py
+
+  LambdaRoleArn:
+    Value: !GetAtt LambdaExecutionRole.Arn
+    Description: IAM role ARN to map as OpenSearch backend role in Dashboards
+
+  DLQUrl:
+    Value: !Ref IngestionDLQ
+    Description: DLQ URL for monitoring
+
+  RawBucketName:
+    Value: !Ref RawBucket
+    Description: Upload PDFs here to trigger ingestion
+
+  ApiKeyId:
+    Value: !Ref ApiKey
+    Description: |
+      API Key ID — retrieve value with:
+        aws apigateway get-api-key --api-key <THIS_ID> --include-value --profile rag-dev
