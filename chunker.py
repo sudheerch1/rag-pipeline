@@ -7,7 +7,7 @@ Three strategies, selectable per document type:
                    words. Best for prose (PDF text, DOCX, HTML, Markdown).
 
   2. semantic    — Groups consecutive blocks by meaning similarity using
-                   Amazon Bedrock Titan embeddings (no local ML libraries needed).
+                   Cohere Embed v4 (no local ML libraries needed).
                    Splits when cosine similarity between adjacent blocks drops
                    below similarity_threshold. Best for long narrative documents.
 
@@ -28,6 +28,7 @@ import time       # ← add this
 from typing import List, Optional
 
 from models import ParsedBlock, Chunk, BlockType
+from llm_clients import embed_query, embed_documents
 
 
 # ── Token counting ────────────────────────────────────────────────────────────
@@ -48,8 +49,6 @@ SEPARATORS = ["\n\n", "\n", ". ", "! ", "? ", "; ", ", ", " ", ""]
 
 # ── Bedrock client for semantic chunking ──────────────────────────────────────
 
-from llm_clients import embed_query
-
 def get_embedding_bedrock(text: str, bedrock_client=None) -> List[float]:
     """
     Get embedding via Cohere Embed v4 (search_query input_type).
@@ -59,7 +58,7 @@ def get_embedding_bedrock(text: str, bedrock_client=None) -> List[float]:
     return embed_query(text[:512])
 
 
-def get_embedding_with_retry(text: str, bedrock_client=None, max_retries: int = 3) -> List[float]:
+def get_embedding_with_retry(text: str, bedrock_client=None, max_retries: int = 5) -> List[float]:
     """
     Retry wrapper for Bedrock embeddings with exponential backoff.
     Retries up to max_retries times before raising.
@@ -245,7 +244,7 @@ def chunk_semantic(
     similarity_threshold: float = 0.75,
 ) -> List[Chunk]:
     """
-    Semantic chunking using Amazon Bedrock Titan embeddings.
+    Semantic chunking using Cohere Embed v4.
 
     How it works:
       1. Embed each block using Bedrock Titan (same model as ingestion)
@@ -268,16 +267,16 @@ def chunk_semantic(
 
     try:
         # Embed all blocks using Bedrock Titan
+        BATCH_SIZE = 90  # Cohere v4 max is 96, stay safely under
+        all_texts = [block.text[:512] for block in blocks]
         embeddings = []
-        for i, block in enumerate(blocks):
-            try:
-                emb = get_embedding_with_retry(block.text)
-                embeddings.append(emb)
-            except Exception as e:
-                print(f"[semantic chunker] Block {i} failed after all retries: {e}")
-                raise
-
-        print(f"[semantic chunker] Embeddings generated, grouping by similarity...")
+        for i in range(0, len(all_texts), BATCH_SIZE):
+            batch = all_texts[i:i + BATCH_SIZE]
+            print(f"[semantic chunker] Embedding batch {i//BATCH_SIZE + 1} ({len(batch)} blocks)...")
+            batch_embeddings = embed_documents(batch)
+            embeddings.extend(batch_embeddings)
+            if i + BATCH_SIZE < len(all_texts):
+                time.sleep(1.0)  # only pause between batches, not between individual calls
 
         chunks: List[Chunk] = []
         chunk_index = 0
