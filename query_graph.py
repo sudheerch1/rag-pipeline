@@ -155,6 +155,9 @@ def run_dedup(state: dict) -> dict:
 # ── Step 5: Answer Generation ─────────────────────────────────────────────────
 
 answer_prompt = PromptTemplate.from_template("""You are a helpful assistant. Answer the question based only on the provided context.
+
+When the context contains financial figures, identify the EXACT line item label (e.g. "Total net sales", "Net sales by segment", "Products", "Services") and the EXACT reporting period (e.g. fiscal year, quarter) associated with each number before using it. If a chunk contains multiple similar figures and it is not clear which one matches the question, say so explicitly rather than guessing.
+
 If the answer is not in the context, say "I cannot find this information in the provided documents."
 
 Context:
@@ -179,7 +182,7 @@ def run_answer(state: dict) -> dict:
     used_chars = 0
 
     for c in state["chunks"]:
-        part = f"Source: {c['source']} (Page {c['page']})\n{c['text']}"
+        part = f"Source: {c['source']} (Page {c['page']}, Section: {c['section']})\n{c['text']}"
         if used_chars + len(part) > budget_chars:
             logger.warning("token budget reached", extra={
                 "step": "run_answer",
