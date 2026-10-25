@@ -15,3 +15,13 @@ package/
 response.json
 requirements-lambda.txt
 query_lambda.zip
+
+package/
+.venv/
+.env
+__pycache__/
+docs/old-MD-Files/
+docs/RAG_Thread_Starter_*.md
+docs/Cognito-URL-login.txt
+docs/#1-Open-Search-activating.txt
+docs/RAG_Pipeline_Project_Summary_*.md
