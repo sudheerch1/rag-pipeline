@@ -25,3 +25,6 @@ docs/RAG_Thread_Starter_*.md
 docs/Cognito-URL-login.txt
 docs/#1-Open-Search-activating.txt
 docs/RAG_Pipeline_Project_Summary_*.md
+
+docs/*.docx
+docs/*.pptx
